@@ -32,6 +32,7 @@ import pwd
 import shutil
 import subprocess
 import sys
+from abc import ABC, abstractmethod
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
 try:  # Python 3.11+
@@ -647,15 +648,42 @@ def check_installed_packages(packages: Iterable[str]) -> Dict[str, Optional[bool
         return {}
 
     rpm = shutil.which("rpm")
-    if not rpm:
-        LOG.warning("Package inspection skipped because 'rpm' is not available")
+    dpkg_query = shutil.which("dpkg-query")
+    if not rpm and not dpkg_query:
+        LOG.warning("Package inspection skipped because neither 'rpm' nor 'dpkg-query' is available")
         return {pkg: None for pkg in package_list}
 
     results: Dict[str, Optional[bool]] = {}
     for pkg in package_list:
+        if rpm:
+            try:
+                proc = subprocess.run(
+                    [rpm, "-q", pkg],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            except OSError as exc:
+                LOG.warning("Failed to inspect package %s: %s", pkg, exc)
+                results[pkg] = None
+                continue
+
+            if proc.returncode == 0:
+                results[pkg] = True
+            elif proc.returncode == 1:
+                # ``rpm -q`` returns 1 when the package is not installed.
+                results[pkg] = False
+            else:
+                LOG.warning(
+                    "Unexpected return code %s while inspecting package %s", proc.returncode, pkg
+                )
+                results[pkg] = None
+            continue
+
+        # Debian/Ubuntu fallback using dpkg-query
         try:
             proc = subprocess.run(
-                [rpm, "-q", pkg],
+                [dpkg_query, "-W", "-f=${Status}", pkg],
                 capture_output=True,
                 text=True,
                 check=False,
@@ -665,15 +693,11 @@ def check_installed_packages(packages: Iterable[str]) -> Dict[str, Optional[bool
             results[pkg] = None
             continue
 
-        if proc.returncode == 0:
-            results[pkg] = True
-        elif proc.returncode == 1:
-            # ``rpm -q`` returns 1 when the package is not installed.
+        if proc.returncode != 0:
             results[pkg] = False
+        elif "install ok installed" in (proc.stdout or ""):
+            results[pkg] = True
         else:
-            LOG.warning(
-                "Unexpected return code %s while inspecting package %s", proc.returncode, pkg
-            )
             results[pkg] = None
     return results
 
@@ -987,30 +1011,116 @@ def build_plan(
     )
 
 
-class PackageManager:
+class PackageManager(ABC):
     """Simple wrapper around the system package manager."""
 
     def __init__(self, dry_run: bool) -> None:
         self.dry_run = dry_run
-        self.executable = shutil.which("dnf") or shutil.which("yum")
+
+    @classmethod
+    def for_system(cls, dry_run: bool) -> "PackageManager":
+        for manager_cls in (DnfManager, AptManager):
+            manager = manager_cls.try_create(dry_run)
+            if manager is not None:
+                return manager
+        raise FileNotFoundError("No supported package manager (dnf/yum or apt) is available on this system")
+
+    @classmethod
+    @abstractmethod
+    def try_create(cls, dry_run: bool) -> Optional["PackageManager"]:
+        """Return an initialised manager when the backend is available."""
+
+    @abstractmethod
+    def is_installed(self, package: str) -> bool:
+        """Return ``True`` when ``package`` is already present on the host."""
+
+    @abstractmethod
+    def install_missing(self, packages: List[str]) -> None:
+        """Install the provided packages without performing any additional checks."""
 
     def install(self, packages: List[str]) -> None:
         if not packages:
             return
-        unique_packages = sorted(set(packages))
-        if not self.executable:
-            if self.dry_run:
-                LOG.warning(
-                    "Package manager (dnf/yum) not available; would install: %s",
-                    ", ".join(unique_packages),
-                )
-                return
-            raise FileNotFoundError("Neither dnf nor yum package manager is available on this system")
 
-        cmd = [self.executable, "-y", "install", *unique_packages]
-        if self.dry_run:
-            LOG.info("[dry-run] Would install packages: %s", ", ".join(unique_packages))
+        unique_packages = sorted(set(packages))
+        missing: List[str] = []
+        for pkg in unique_packages:
+            try:
+                installed = self.is_installed(pkg)
+            except OSError as exc:
+                LOG.warning("Failed to determine installation status for %s: %s", pkg, exc)
+                missing.append(pkg)
+                continue
+
+            if installed:
+                LOG.info("Package '%s' is already installed; skipping.", pkg)
+            else:
+                missing.append(pkg)
+
+        if not missing:
             return
+
+        if self.dry_run:
+            LOG.info("[dry-run] Would install packages: %s", ", ".join(missing))
+            return
+
+        self.install_missing(missing)
+
+
+class DnfManager(PackageManager):
+    """Package manager implementation for dnf/yum based systems."""
+
+    def __init__(self, executable: str, dry_run: bool) -> None:
+        super().__init__(dry_run)
+        self.executable = executable
+        self.query_tool = shutil.which("rpm") or "rpm"
+
+    @classmethod
+    def try_create(cls, dry_run: bool) -> Optional["PackageManager"]:
+        executable = shutil.which("dnf") or shutil.which("yum")
+        if not executable:
+            return None
+        return cls(executable, dry_run)
+
+    def is_installed(self, package: str) -> bool:
+        result = subprocess.run(
+            [self.query_tool, "-q", package], capture_output=True, text=True, check=False
+        )
+        return result.returncode == 0
+
+    def install_missing(self, packages: List[str]) -> None:
+        cmd = [self.executable, "-y", "install", *packages]
+        run_command(cmd)
+
+
+class AptManager(PackageManager):
+    """Package manager implementation for Debian/Ubuntu based systems."""
+
+    def __init__(self, executable: str, dry_run: bool) -> None:
+        super().__init__(dry_run)
+        self.executable = executable
+        self.query_tool = shutil.which("dpkg-query") or "dpkg-query"
+
+    @classmethod
+    def try_create(cls, dry_run: bool) -> Optional["PackageManager"]:
+        executable = shutil.which("apt-get") or shutil.which("apt")
+        if not executable:
+            return None
+        return cls(executable, dry_run)
+
+    def is_installed(self, package: str) -> bool:
+        result = subprocess.run(
+            [self.query_tool, "-W", "-f=${Status}", package],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            return False
+        return "install ok installed" in (result.stdout or "")
+
+    def install_missing(self, packages: List[str]) -> None:
+        cmd = [self.executable, "install", "-y", *packages]
         run_command(cmd)
 
 
@@ -1105,7 +1215,20 @@ class Provisioner:
             LOG.info("Configured %s", spec.path)
 
     def install_packages(self) -> None:
-        manager = PackageManager(self.dry_run)
+        if not self.plan.packages:
+            return
+
+        try:
+            manager = PackageManager.for_system(self.dry_run)
+        except FileNotFoundError:
+            if self.dry_run:
+                LOG.warning(
+                    "Package manager not available; would install: %s",
+                    ", ".join(sorted(set(self.plan.packages))),
+                )
+                return
+            raise
+
         manager.install(self.plan.packages)
 
 
