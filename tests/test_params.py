@@ -122,19 +122,67 @@ def test_package_installation_invoked(monkeypatch):
     writer = oracle_setup.PlanWriter(dry_run=False)
     provisioner = oracle_setup.Provisioner(plan, writer, dry_run=False)
 
-    monkeypatch.setattr(oracle_setup.shutil, "which", lambda name: "/usr/bin/dnf" if name == "dnf" else None)
+    original_which = oracle_setup.shutil.which
+
+    def fake_which(name):
+        if name == "dnf":
+            return "/usr/bin/dnf"
+        if name == "yum":
+            return None
+        if name == "rpm":
+            return "/usr/bin/rpm"
+        return original_which(name)
+
+    monkeypatch.setattr(oracle_setup.shutil, "which", fake_which)
     run_calls = []
 
     def fake_run(cmd, capture_output=True, text=True, check=False):
         run_calls.append(cmd)
+        if cmd[0].endswith("rpm"):
+            return mock.Mock(returncode=1, stdout="", stderr="")
         return mock.Mock(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(oracle_setup.subprocess, "run", fake_run)
 
     provisioner.install_packages()
 
-    assert run_calls
-    assert run_calls[0][:3] == ["/usr/bin/dnf", "-y", "install"]
+    assert any(cmd[0].endswith("dnf") for cmd in run_calls)
+    install_cmd = next(cmd for cmd in run_calls if cmd[0].endswith("dnf"))
+    assert install_cmd[:3] == ["/usr/bin/dnf", "-y", "install"]
+
+
+def test_package_installation_skips_preinstalled(monkeypatch, caplog):
+    res = fake_resources(8)
+    plan = oracle_setup.build_plan(res, "oracle", fmw_user=None)
+    plan.packages = ["pkg-preinstalled"]
+    writer = oracle_setup.PlanWriter(dry_run=False)
+    provisioner = oracle_setup.Provisioner(plan, writer, dry_run=False)
+
+    def fake_which(name):
+        if name == "dnf":
+            return "/usr/bin/dnf"
+        if name == "rpm":
+            return "/usr/bin/rpm"
+        return None
+
+    monkeypatch.setattr(oracle_setup.shutil, "which", fake_which)
+
+    run_calls = []
+
+    def fake_run(cmd, capture_output=True, text=True, check=False):
+        run_calls.append(cmd)
+        if cmd[0].endswith("rpm"):
+            return mock.Mock(returncode=0, stdout="", stderr="")
+        raise AssertionError("Installation should not be invoked for preinstalled packages")
+
+    monkeypatch.setattr(oracle_setup.subprocess, "run", fake_run)
+
+    caplog.set_level("INFO")
+    provisioner.install_packages()
+
+    assert any(cmd[0].endswith("rpm") for cmd in run_calls)
+    assert not any(cmd[0].endswith("dnf") for cmd in run_calls)
+    assert any("already installed" in record.message for record in caplog.records)
 
 
 def test_parse_args_supports_inspection():
