@@ -651,6 +651,114 @@ class FileSpec:
     mode: int = 0o644
 
 
+@dataclasses.dataclass(frozen=True)
+class DnfRepositorySettings:
+    """Configuration that controls temporary dnf repository management."""
+
+    mode: str = "system"
+    local_repo_root: Optional[pathlib.Path] = None
+    repo_dir: pathlib.Path = dataclasses.field(default_factory=lambda: pathlib.Path("/etc/yum.repos.d"))
+    repo_filename: str = "oracle-setup-local.repo"
+    cache_dir: pathlib.Path = dataclasses.field(default_factory=lambda: pathlib.Path("/var/cache/dnf"))
+
+    def use_local_repo(self) -> bool:
+        return self.mode.lower() == "local"
+
+    def repo_file_path(self) -> pathlib.Path:
+        return self.repo_dir / self.repo_filename
+
+
+class _DnfRepositoryContext:
+    """Context manager that temporarily overrides system repositories."""
+
+    def __init__(
+        self,
+        executable: str,
+        dry_run: bool,
+        settings: Optional[DnfRepositorySettings],
+    ) -> None:
+        self.executable = executable
+        self.dry_run = dry_run
+        self.settings = settings
+        self._backup_dir: Optional[pathlib.Path] = None
+        self._repo_path: Optional[pathlib.Path] = None
+
+    def __enter__(self) -> "_DnfRepositoryContext":
+        if not self.settings or not self.settings.use_local_repo():
+            return self
+
+        local_root = self.settings.local_repo_root
+        if local_root is None:
+            raise ValueError("local repository mode requires a --local-repo-root path")
+
+        app_stream_dir = local_root / "AppStream"
+        base_os_dir = local_root / "BaseOS"
+        missing = [path for path in (app_stream_dir, base_os_dir) if not path.is_dir()]
+        if missing:
+            missing_str = ", ".join(str(path) for path in missing)
+            raise FileNotFoundError(f"Local repository directories not found: {missing_str}")
+
+        repo_dir = self.settings.repo_dir
+        repo_dir.mkdir(parents=True, exist_ok=True)
+        repo_path = self.settings.repo_file_path()
+
+        if self.dry_run:
+            LOG.info("[dry-run] Would disable existing dnf repositories in %s", repo_dir)
+            LOG.info("[dry-run] Would create temporary local repository %s", repo_path)
+            return self
+
+        timestamp = _dt.datetime.now().strftime("%Y%m%d%H%M%S")
+        backup_dir = repo_dir / f".oracle-setup-backup-{timestamp}"
+        backup_dir.mkdir(parents=True, exist_ok=False)
+
+        LOG.info("Disabling existing dnf repositories in %s", repo_dir)
+        for repo_file in repo_dir.glob("*.repo"):
+            shutil.move(repo_file, backup_dir / repo_file.name)
+
+        app_stream_url = app_stream_dir.resolve().as_uri()
+        base_os_url = base_os_dir.resolve().as_uri()
+        content = (
+            f"[{self.settings.repo_filename}-appstream]\n"
+            "name=Oracle Linux AppStream (local)\n"
+            f"baseurl={app_stream_url}\n"
+            "enabled=1\n"
+            "gpgcheck=0\n\n"
+            f"[{self.settings.repo_filename}-baseos]\n"
+            "name=Oracle Linux BaseOS (local)\n"
+            f"baseurl={base_os_url}\n"
+            "enabled=1\n"
+            "gpgcheck=0\n"
+        )
+        repo_path.write_text(content, encoding="utf-8")
+        os.chmod(repo_path, 0o644)
+        LOG.info("Configured local repository %s", repo_path)
+
+        run_command([self.executable, "clean", "metadata"], check=False)
+        run_command([self.executable, "clean", "all"], check=False)
+        if self.settings.cache_dir.exists():
+            shutil.rmtree(self.settings.cache_dir, ignore_errors=True)
+
+        self._backup_dir = backup_dir
+        self._repo_path = repo_path
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if not self.settings or not self.settings.use_local_repo() or self.dry_run:
+            return None
+
+        try:
+            if self._repo_path and self._repo_path.exists():
+                self._repo_path.unlink()
+        finally:
+            if self._backup_dir and self._backup_dir.exists():
+                for moved in sorted(self._backup_dir.iterdir()):
+                    shutil.move(moved, self.settings.repo_dir / moved.name)
+                shutil.rmtree(self._backup_dir, ignore_errors=True)
+                LOG.info("Restored original dnf repositories in %s", self.settings.repo_dir)
+
+        return None
+
+
 def _calculate_hugepages(res: ResourceSummary) -> int:
     """Estimate HugePages count based on RAM.
 
@@ -1107,20 +1215,25 @@ def build_plan(
 class PackageManager(ABC):
     """Simple wrapper around the system package manager."""
 
-    def __init__(self, dry_run: bool) -> None:
+    def __init__(self, dry_run: bool, repo_config: Optional[DnfRepositorySettings] = None) -> None:
         self.dry_run = dry_run
+        self.repo_config = repo_config
 
     @classmethod
-    def for_system(cls, dry_run: bool) -> "PackageManager":
+    def for_system(
+        cls, dry_run: bool, repo_config: Optional[DnfRepositorySettings] = None
+    ) -> "PackageManager":
         for manager_cls in (DnfManager, AptManager):
-            manager = manager_cls.try_create(dry_run)
+            manager = manager_cls.try_create(dry_run, repo_config=repo_config)
             if manager is not None:
                 return manager
         raise FileNotFoundError("No supported package manager (dnf/yum or apt) is available on this system")
 
     @classmethod
     @abstractmethod
-    def try_create(cls, dry_run: bool) -> Optional["PackageManager"]:
+    def try_create(
+        cls, dry_run: bool, repo_config: Optional[DnfRepositorySettings] = None
+    ) -> Optional["PackageManager"]:
         """Return an initialised manager when the backend is available."""
 
     @abstractmethod
@@ -1163,17 +1276,24 @@ class PackageManager(ABC):
 class DnfManager(PackageManager):
     """Package manager implementation for dnf/yum based systems."""
 
-    def __init__(self, executable: str, dry_run: bool) -> None:
-        super().__init__(dry_run)
+    def __init__(
+        self,
+        executable: str,
+        dry_run: bool,
+        repo_config: Optional[DnfRepositorySettings],
+    ) -> None:
+        super().__init__(dry_run, repo_config=repo_config)
         self.executable = executable
         self.query_tool = shutil.which("rpm") or "rpm"
 
     @classmethod
-    def try_create(cls, dry_run: bool) -> Optional["PackageManager"]:
+    def try_create(
+        cls, dry_run: bool, repo_config: Optional[DnfRepositorySettings] = None
+    ) -> Optional["PackageManager"]:
         executable = shutil.which("dnf") or shutil.which("yum")
         if not executable:
             return None
-        return cls(executable, dry_run)
+        return cls(executable, dry_run, repo_config)
 
     def is_installed(self, package: str) -> bool:
         result = subprocess.run(
@@ -1182,24 +1302,27 @@ class DnfManager(PackageManager):
         return result.returncode == 0
 
     def install_missing(self, packages: List[str]) -> None:
-        cmd = [self.executable, "-y", "install", *packages]
-        run_command(cmd)
+        with _DnfRepositoryContext(self.executable, self.dry_run, self.repo_config):
+            cmd = [self.executable, "-y", "install", *packages]
+            run_command(cmd)
 
 
 class AptManager(PackageManager):
     """Package manager implementation for Debian/Ubuntu based systems."""
 
-    def __init__(self, executable: str, dry_run: bool) -> None:
-        super().__init__(dry_run)
+    def __init__(self, executable: str, dry_run: bool, repo_config: Optional[DnfRepositorySettings]) -> None:
+        super().__init__(dry_run, repo_config=repo_config)
         self.executable = executable
         self.query_tool = shutil.which("dpkg-query") or "dpkg-query"
 
     @classmethod
-    def try_create(cls, dry_run: bool) -> Optional["PackageManager"]:
+    def try_create(
+        cls, dry_run: bool, repo_config: Optional[DnfRepositorySettings] = None
+    ) -> Optional["PackageManager"]:
         executable = shutil.which("apt-get") or shutil.which("apt")
         if not executable:
             return None
-        return cls(executable, dry_run)
+        return cls(executable, dry_run, repo_config)
 
     def is_installed(self, package: str) -> bool:
         result = subprocess.run(
@@ -1226,11 +1349,13 @@ class Provisioner:
         writer: PlanWriter,
         dry_run: bool,
         update_existing_users: bool = False,
+        repo_config: Optional[DnfRepositorySettings] = None,
     ) -> None:
         self.plan = plan
         self.writer = writer
         self.dry_run = dry_run
         self.update_existing_users = update_existing_users
+        self.repo_config = repo_config
 
     def apply(self) -> None:
         self.ensure_groups()
@@ -1371,7 +1496,7 @@ class Provisioner:
             return
 
         try:
-            manager = PackageManager.for_system(self.dry_run)
+            manager = PackageManager.for_system(self.dry_run, repo_config=self.repo_config)
         except FileNotFoundError:
             if self.dry_run:
                 LOG.warning(
@@ -1457,6 +1582,18 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Align existing user accounts with the desired configuration.",
     )
+    parser.add_argument(
+        "--repo-mode",
+        choices=("system", "local"),
+        default="system",
+        help="Control how dnf repositories are managed (default: system uses existing configuration).",
+    )
+    parser.add_argument(
+        "--local-repo-root",
+        type=pathlib.Path,
+        default=pathlib.Path("/INSTALL"),
+        help="Path to the mounted Oracle Linux media when --repo-mode=local is used.",
+    )
     return parser.parse_args(argv)
 
 
@@ -1535,12 +1672,18 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         inspection = inspect_current_system(plan)
         LOG.info("Inspection report:\n%s", json.dumps(inspection, indent=2))
 
+    repo_settings = DnfRepositorySettings(
+        mode=args.repo_mode,
+        local_repo_root=args.local_repo_root if args.repo_mode == "local" else None,
+    )
+
     writer = PlanWriter(dry_run=not args.apply)
     provisioner = Provisioner(
         plan,
         writer,
         dry_run=not args.apply,
         update_existing_users=args.update_existing_users,
+        repo_config=repo_settings,
     )
 
     if args.apply:

@@ -1,6 +1,7 @@
 import json
 import pathlib
 import sys
+from typing import List
 from unittest import mock
 
 import pytest
@@ -227,6 +228,74 @@ def test_package_installation_invoked(monkeypatch):
     assert any(cmd[0].endswith("dnf") for cmd in run_calls)
     install_cmd = next(cmd for cmd in run_calls if cmd[0].endswith("dnf"))
     assert install_cmd[:3] == ["/usr/bin/dnf", "-y", "install"]
+
+
+def test_dnf_local_repository_management(tmp_path, monkeypatch):
+    res = fake_resources(8)
+    plan = oracle_setup.build_plan(res, "oracle", fmw_user=None)
+    plan.packages = ["pkg-local"]
+    writer = oracle_setup.PlanWriter(dry_run=False)
+
+    repo_dir = tmp_path / "yum.repos.d"
+    repo_dir.mkdir()
+    original_repo = repo_dir / "original.repo"
+    original_repo.write_text("[orig]\nname=Original\n", encoding="utf-8")
+
+    install_root = tmp_path / "INSTALL"
+    (install_root / "AppStream").mkdir(parents=True)
+    (install_root / "BaseOS").mkdir(parents=True)
+
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+
+    repo_settings = oracle_setup.DnfRepositorySettings(
+        mode="local",
+        local_repo_root=install_root,
+        repo_dir=repo_dir,
+        repo_filename="oracle-local.repo",
+        cache_dir=cache_dir,
+    )
+
+    provisioner = oracle_setup.Provisioner(
+        plan,
+        writer,
+        dry_run=False,
+        repo_config=repo_settings,
+    )
+
+    def fake_which(name):
+        if name == "dnf":
+            return "/usr/bin/dnf"
+        if name == "rpm":
+            return "/usr/bin/rpm"
+        return None
+
+    monkeypatch.setattr(oracle_setup.shutil, "which", fake_which)
+
+    def fake_subprocess_run(cmd, capture_output=True, text=True, check=False):
+        if cmd[0].endswith("rpm"):
+            return mock.Mock(returncode=1, stdout="", stderr="")
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(oracle_setup.subprocess, "run", fake_subprocess_run)
+
+    executed_cmds: List[List[str]] = []
+
+    def fake_run_command(cmd, check=True):
+        executed_cmds.append(cmd)
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(oracle_setup, "run_command", fake_run_command)
+
+    provisioner.install_packages()
+
+    assert original_repo.exists()
+    assert not any(path.name == "oracle-local.repo" for path in repo_dir.iterdir())
+    assert not any(path.name.startswith(".oracle-setup-backup") for path in repo_dir.iterdir())
+    assert not cache_dir.exists()
+    assert any(cmd[:3] == ["/usr/bin/dnf", "clean", "metadata"] for cmd in executed_cmds)
+    assert any(cmd[:3] == ["/usr/bin/dnf", "clean", "all"] for cmd in executed_cmds)
+    assert any(cmd[:3] == ["/usr/bin/dnf", "-y", "install"] for cmd in executed_cmds)
 
 
 def test_package_installation_skips_preinstalled(monkeypatch, caplog):
