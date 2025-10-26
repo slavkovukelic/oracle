@@ -1509,7 +1509,17 @@ class Provisioner:
         manager.install(self.plan.packages)
 
 
-def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Create the :class:`argparse.ArgumentParser` used by the CLI.
+
+    Exposing the parser builder allows other tooling—such as GUI frontends or
+    automated schedulers—to introspect the available options without having to
+    duplicate the argument definitions.  The legacy implementation embedded the
+    parser construction directly inside :func:`parse_args`; factoring it into a
+    helper keeps backwards compatibility while making the configuration more
+    reusable.
+    """
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--oracle-user",
@@ -1594,7 +1604,11 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         default=pathlib.Path("/INSTALL"),
         help="Path to the mounted Oracle Linux media when --repo-mode=local is used.",
     )
-    return parser.parse_args(argv)
+    return parser
+
+
+def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
+    return build_arg_parser().parse_args(argv)
 
 
 class _JSONLogFormatter(logging.Formatter):
