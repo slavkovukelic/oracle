@@ -157,6 +157,12 @@ class ExecutionBundle:
     arguments: Tuple[str, ...]
     config_path: pathlib.Path
     config_content: bytes
+    bootstrap_path: Optional[pathlib.Path] = None
+    bootstrap_content: Optional[bytes] = None
+    environment: Tuple[Tuple[str, str], ...] = dataclasses.field(default_factory=tuple)
+    perform_mount: bool = False
+    mount_device: Optional[str] = None
+    mount_point: Optional[str] = None
 
     @classmethod
     def from_paths(
@@ -165,13 +171,27 @@ class ExecutionBundle:
         config_path: pathlib.Path,
         config_text: str,
         arguments: Sequence[str],
+        *,
+        bootstrap_path: Optional[pathlib.Path] = None,
+        environment: Optional[Mapping[str, str]] = None,
+        perform_mount: bool = False,
+        mount_device: Optional[str] = None,
+        mount_point: Optional[str] = None,
     ) -> "ExecutionBundle":
+        bootstrap_content = bootstrap_path.read_bytes() if bootstrap_path else None
+        env_items: Tuple[Tuple[str, str], ...] = tuple(sorted(environment.items())) if environment else tuple()
         return cls(
             script_path=script_path,
             script_content=script_path.read_bytes(),
             arguments=tuple(arguments),
             config_path=config_path,
             config_content=config_text.encode("utf-8"),
+            bootstrap_path=bootstrap_path,
+            bootstrap_content=bootstrap_content,
+            environment=env_items,
+            perform_mount=perform_mount,
+            mount_device=mount_device,
+            mount_point=mount_point,
         )
 
     def to_payload(self) -> Dict[str, Any]:
@@ -244,35 +264,107 @@ class SSHExecutor:
         except Exception as exc:  # pragma: no cover - depends on network environment
             raise RuntimeError(f"Failed to establish SSH connection: {exc}") from exc
 
-        stdout_bytes = b""
-        stderr_bytes = b""
+        stdout_chunks: List[bytes] = []
+        stderr_chunks: List[bytes] = []
         returncode: Optional[int] = None
+        remote_dir = (self.connection.remote_directory or ".").replace("\\", "/")
+        remote_script_name = bundle.script_path.name
+        remote_config_name = bundle.config_path.name
+        remote_bootstrap_name: Optional[str] = bundle.bootstrap_path.name if bundle.bootstrap_path else None
+        uploaded_files: List[str] = [remote_script_name, remote_config_name]
+        if bundle.bootstrap_content is not None and remote_bootstrap_name:
+            uploaded_files.append(remote_bootstrap_name)
+
+        mount_requested = bool(bundle.perform_mount)
+        mounted = False
         try:
             sftp = client.open_sftp()
-            remote_dir = (self.connection.remote_directory or ".").replace("\\", "/")
             if remote_dir not in ("", "."):
                 self._ensure_remote_directory(sftp, remote_dir)
-            remote_script = posixpath.join(remote_dir, bundle.script_path.name) if remote_dir not in ("", ".") else bundle.script_path.name
-            remote_config = posixpath.join(remote_dir, bundle.config_path.name) if remote_dir not in ("", ".") else bundle.config_path.name
-
+            remote_script = (
+                posixpath.join(remote_dir, remote_script_name)
+                if remote_dir not in ("", ".")
+                else remote_script_name
+            )
+            remote_config = (
+                posixpath.join(remote_dir, remote_config_name)
+                if remote_dir not in ("", ".")
+                else remote_config_name
+            )
             self._upload_file(sftp, remote_script, bundle.script_content)
             self._upload_file(sftp, remote_config, bundle.config_content)
+
+            if bundle.bootstrap_content is None or not remote_bootstrap_name:
+                raise RuntimeError("Bootstrap script is required but was not provided in the execution bundle.")
+
+            remote_bootstrap = (
+                posixpath.join(remote_dir, remote_bootstrap_name)
+                if remote_dir not in ("", ".")
+                else remote_bootstrap_name
+            )
+            self._upload_file(sftp, remote_bootstrap, bundle.bootstrap_content)
+            sftp.chmod(remote_bootstrap, 0o755)
 
             if bundle.script_path.suffix == ".sh":
                 sftp.chmod(remote_script, 0o755)
 
             sftp.close()
 
+            if mount_requested:
+                if not bundle.mount_device or not bundle.mount_point:
+                    raise RuntimeError("Mount device and mount point must be provided when mounting is requested.")
+                mkdir_command = f"sudo mkdir -p {shlex.quote(bundle.mount_point)}"
+                out, err, code = self._exec_remote_command(client, mkdir_command)
+                if out:
+                    stdout_chunks.append(out)
+                if err:
+                    stderr_chunks.append(err)
+                if code != 0:
+                    raise RuntimeError(self._format_remote_failure("create mount point", mkdir_command, code, err))
+
+                mount_command = self._build_mount_command(bundle.mount_device, bundle.mount_point)
+                out, err, code = self._exec_remote_command(client, mount_command)
+                if out:
+                    stdout_chunks.append(out)
+                if err:
+                    stderr_chunks.append(err)
+                if code != 0:
+                    raise RuntimeError(self._format_remote_failure("mount repository", mount_command, code, err))
+                mounted = True
+
             command = self._build_command(bundle, remote_dir)
-            stdin, stdout, stderr = client.exec_command(command, timeout=self.command_timeout)
-            stdout_bytes = stdout.read()
-            stderr_bytes = stderr.read()
-            returncode = stdout.channel.recv_exit_status()
+            out, err, returncode = self._exec_remote_command(client, command, timeout=self.command_timeout)
+            if out:
+                stdout_chunks.append(out)
+            if err:
+                stderr_chunks.append(err)
         except Exception as exc:
             raise RuntimeError(f"Remote execution failed: {exc}") from exc
         finally:
+            cleanup_stdout: List[bytes] = []
+            cleanup_stderr: List[bytes] = []
+            if mounted and bundle.mount_point:
+                try:
+                    umount_command = self._build_umount_command(bundle.mount_point)
+                    out, err, _ = self._exec_remote_command(client, umount_command)
+                    if out:
+                        cleanup_stdout.append(out)
+                    if err:
+                        cleanup_stderr.append(err)
+                except Exception as cleanup_exc:  # pragma: no cover - defensive logging
+                    LOG.warning("Failed to unmount remote repository: %s", cleanup_exc)
+            try:
+                extra_out, extra_err = self._cleanup_remote_files(client, remote_dir, uploaded_files)
+                cleanup_stdout.extend(extra_out)
+                cleanup_stderr.extend(extra_err)
+            except Exception as cleanup_exc:  # pragma: no cover - defensive logging
+                LOG.warning("Failed to clean up remote files: %s", cleanup_exc)
             client.close()
+            stdout_chunks.extend(cleanup_stdout)
+            stderr_chunks.extend(cleanup_stderr)
 
+        stdout_bytes = b"".join(stdout_chunks)
+        stderr_bytes = b"".join(stderr_chunks)
         stdout_text = stdout_bytes.decode("utf-8", errors="replace")
         stderr_text = stderr_bytes.decode("utf-8", errors="replace")
         status = "completed" if returncode == 0 else "failed"
@@ -292,6 +384,24 @@ class SSHExecutor:
             raw=payload,
         )
 
+    def _exec_remote_command(
+        self,
+        client: Any,
+        command: str,
+        *,
+        timeout: Optional[int] = None,
+    ) -> Tuple[bytes, bytes, int]:
+        stdin, stdout, stderr = client.exec_command(command, timeout=timeout or self.command_timeout)
+        out = stdout.read()
+        err = stderr.read()
+        code = stdout.channel.recv_exit_status()
+        return out, err, code
+
+    def _format_remote_failure(self, action: str, command: str, code: int, stderr: bytes) -> str:
+        stderr_text = stderr.decode("utf-8", errors="replace") if stderr else ""
+        details = f" (stderr: {stderr_text.strip()})" if stderr_text.strip() else ""
+        return f"Failed to {action} (exit status {code}) using command: {command}{details}"
+
     def _ensure_remote_directory(self, sftp: Any, remote_dir: str) -> None:
         parts = [part for part in remote_dir.split("/") if part and part != "."]
         current = ""
@@ -306,17 +416,47 @@ class SSHExecutor:
         with sftp.file(remote_path, "wb") as remote_file:
             remote_file.write(content)
 
+    def _cleanup_remote_files(
+        self,
+        client: Any,
+        remote_dir: str,
+        files: Sequence[str],
+    ) -> Tuple[List[bytes], List[bytes]]:
+        if not files:
+            return [], []
+        command_parts: List[str] = []
+        if remote_dir not in ("", "."):
+            command_parts.extend(["cd", shlex.quote(remote_dir), "&&"])
+        command_parts.append("rm -f")
+        command_parts.extend(shlex.quote(name) for name in files)
+        command = " ".join(command_parts)
+        out, err, _ = self._exec_remote_command(client, command)
+        stdout_chunks = [out] if out else []
+        stderr_chunks = [err] if err else []
+        return stdout_chunks, stderr_chunks
+
+    def _build_mount_command(self, device: str, mount_point: str) -> str:
+        loop_option = " -o loop" if not device.startswith("/dev/") else ""
+        return f"sudo mount{loop_option} {shlex.quote(device)} {shlex.quote(mount_point)}"
+
+    def _build_umount_command(self, mount_point: str) -> str:
+        return f"sudo umount {shlex.quote(mount_point)}"
+
     def _build_command(self, bundle: ExecutionBundle, remote_dir: str) -> str:
-        script_name = bundle.script_path.name
+        bootstrap_name = (
+            bundle.bootstrap_path.name
+            if bundle.bootstrap_path is not None
+            else bundle.script_path.name
+        )
         command_parts: List[str] = []
         if remote_dir not in ("", "."):
             command_parts.extend(["cd", shlex.quote(remote_dir), "&&"])
 
-        if bundle.script_path.suffix == ".sh":
-            command_parts.append("bash")
-        else:
-            command_parts.append("python3")
-        command_parts.append(shlex.quote(script_name))
+        for key, value in bundle.environment:
+            command_parts.append(f"{key}={shlex.quote(value)}")
+
+        command_parts.append("bash")
+        command_parts.append(shlex.quote(bootstrap_name))
         for arg in bundle.arguments:
             command_parts.append(shlex.quote(arg))
         return " ".join(command_parts)
@@ -371,6 +511,9 @@ class OracleSetupClient(tk.Tk):
         self.ssh_password_var = tk.StringVar(value="")
         self.ssh_key_var = tk.StringVar(value="")
         self.ssh_remote_dir_var = tk.StringVar(value=ssh_remote_directory)
+        self.repo_device_var = tk.StringVar(value="")
+        self.repo_mount_var = tk.StringVar(value="")
+        self.repo_mount_enabled_var = tk.BooleanVar(value=False)
 
         self._build_ui()
         self._load_config()
@@ -424,6 +567,26 @@ class OracleSetupClient(tk.Tk):
 
         ttk.Label(connection_grid, text="Remote directory:").grid(row=3, column=0, sticky="w", pady=(5, 0))
         ttk.Entry(connection_grid, textvariable=self.ssh_remote_dir_var).grid(row=3, column=1, columnspan=3, sticky="we", padx=5, pady=(5, 0))
+
+        repo_frame = ttk.LabelFrame(main, text="Remote Repository / Mounts")
+        repo_frame.pack(fill="x", expand=False, pady=(0, 10))
+
+        repo_grid = ttk.Frame(repo_frame)
+        repo_grid.pack(fill="x", expand=True, padx=8, pady=8)
+        for column in range(2):
+            repo_grid.columnconfigure(column, weight=1)
+
+        ttk.Label(repo_grid, text="ISO Path or Device:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(repo_grid, textvariable=self.repo_device_var).grid(row=0, column=1, sticky="we", padx=5)
+
+        ttk.Label(repo_grid, text="Mount Point:").grid(row=1, column=0, sticky="w", pady=(5, 0))
+        ttk.Entry(repo_grid, textvariable=self.repo_mount_var).grid(row=1, column=1, sticky="we", padx=5, pady=(5, 0))
+
+        ttk.Checkbutton(
+            repo_grid,
+            text="Perform Mount",
+            variable=self.repo_mount_enabled_var,
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         arguments_frame = ttk.LabelFrame(main, text="Script Parameters")
         arguments_frame.pack(fill="x", expand=False, pady=(0, 10))
@@ -570,7 +733,52 @@ class OracleSetupClient(tk.Tk):
 
         argument_values = self._collect_argument_values()
         cli_args = build_cli_arguments(self.argument_specs, argument_values)
-        bundle = ExecutionBundle.from_paths(script_path, self.config_path, config_text, cli_args)
+        bootstrap_path = self.scripts.get("oracle_setup_bootstrap.sh")
+        if bootstrap_path is None:
+            candidate = self.script_directory / "oracle_setup_bootstrap.sh"
+            if candidate.exists():
+                bootstrap_path = candidate
+        if bootstrap_path is None:
+            messagebox.showerror(
+                "Missing bootstrap script",
+                "oracle_setup_bootstrap.sh could not be located in the script directory.",
+            )
+            return
+
+        mount_device = self.repo_device_var.get().strip()
+        mount_point = self.repo_mount_var.get().strip()
+        perform_mount = bool(self.repo_mount_enabled_var.get())
+        if perform_mount and not mount_device:
+            messagebox.showerror("Missing ISO path", "Provide the ISO path or device to mount.")
+            return
+        if perform_mount and not mount_point:
+            messagebox.showerror("Missing mount point", "Provide the mount point to use when mounting the repository.")
+            return
+
+        normalized_mount_point = mount_point or None
+        repo_mode = "local" if normalized_mount_point else "auto"
+        env_vars: Dict[str, str] = {
+            "ORACLE_BOOTSTRAP_REPO_MODE": repo_mode,
+            "ORACLE_BOOTSTRAP_LOCAL_REPO": normalized_mount_point or "/INSTALL",
+        }
+
+        normalized_mount_device = mount_device or None
+
+        try:
+            bundle = ExecutionBundle.from_paths(
+                script_path,
+                self.config_path,
+                config_text,
+                cli_args,
+                bootstrap_path=bootstrap_path,
+                environment=env_vars,
+                perform_mount=perform_mount,
+                mount_device=normalized_mount_device,
+                mount_point=normalized_mount_point,
+            )
+        except OSError as exc:
+            messagebox.showerror("Bundle creation failed", f"Unable to prepare execution bundle: {exc}")
+            return
         executor = SSHExecutor(connection)
 
         self.run_button.configure(state="disabled")
