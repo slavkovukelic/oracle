@@ -1,0 +1,41 @@
+[packages]
+install = [
+  "bc",
+  "binutils",
+  "compat-libcap1",
+  "elfutils-libelf-devel",
+  "gcc",
+  "glibc",
+  "ksh",
+  "libaio",
+  "libstdc++",
+  "make",
+  "net-tools",
+  "nfs-utils",
+  "smartmontools",
+  "sysstat",
+]
+
+[[groups]]
+name = "oinstall"
+
+[[groups]]
+name = "dba"
+
+[[users]]
+name = "oracle"
+primary_group = "dba"
+supplementary_groups = ["oinstall"]
+home = "/oracle"
+
+[[users]]
+name = "fmw"
+primary_group = "dba"
+supplementary_groups = ["oinstall"]
+home = "/fmw"
+
+[paths]
+data_root = "/oradata"
+profile_dir = "/etc/profile.d"
+ora_inventory = "/etc/oraInst.loc"
+oratab = "/etc/oratab"
