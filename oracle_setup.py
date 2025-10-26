@@ -514,12 +514,66 @@ def read_sysctl_value(key: str) -> Optional[str]:
     return _normalize_whitespace(raw)
 
 
+def check_installed_packages(packages: Iterable[str]) -> Dict[str, Optional[bool]]:
+    """Determine whether each package in ``packages`` is installed.
+
+    Returns a mapping of package name to ``True`` (installed), ``False``
+    (missing) or ``None`` when the status could not be determined.  The
+    function prefers the system ``rpm`` binary because it is available on
+    Oracle Linux by default.  When package metadata cannot be queried the
+    caller receives an ``unknown`` status instead of an exception so that the
+    inspection report can still be generated.
+    """
+
+    package_list = list(packages)
+    if not package_list:
+        return {}
+
+    rpm = shutil.which("rpm")
+    if not rpm:
+        LOG.warning("Package inspection skipped because 'rpm' is not available")
+        return {pkg: None for pkg in package_list}
+
+    results: Dict[str, Optional[bool]] = {}
+    for pkg in package_list:
+        try:
+            proc = subprocess.run(
+                [rpm, "-q", pkg],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError as exc:
+            LOG.warning("Failed to inspect package %s: %s", pkg, exc)
+            results[pkg] = None
+            continue
+
+        if proc.returncode == 0:
+            results[pkg] = True
+        elif proc.returncode == 1:
+            # ``rpm -q`` returns 1 when the package is not installed.
+            results[pkg] = False
+        else:
+            LOG.warning(
+                "Unexpected return code %s while inspecting package %s", proc.returncode, pkg
+            )
+            results[pkg] = None
+    return results
+
+
+def inspect_current_system(
+    plan: "ConfigurationPlan",
+    sysctl_reader: Optional[Callable[[str], Optional[str]]] = None,
+    package_checker: Optional[Callable[[Iterable[str]], Dict[str, Optional[bool]]]] = None,
 def inspect_current_system(
     plan: "ConfigurationPlan", sysctl_reader: Optional[Callable[[str], Optional[str]]] = None
 ) -> Dict[str, object]:
     """Compare the live system state with the recommended configuration plan.
 
     ``sysctl_reader`` exists primarily for unit testing and allows callers to
+    override how kernel parameters are retrieved.  ``package_checker`` fulfils a
+    similar role for unit tests by allowing them to inject a deterministic view
+    of installed packages.
     override how kernel parameters are retrieved.
     """
 
@@ -543,6 +597,44 @@ def inspect_current_system(
 
     recommendations = [key for key, data in kernel_report.items() if data["status"] != "ok"]
 
+    package_results = (
+        package_checker(plan.packages) if package_checker else check_installed_packages(plan.packages)
+    )
+    package_details: Dict[str, str] = {}
+    missing_packages: List[str] = []
+    installed_packages: List[str] = []
+    unknown_packages: List[str] = []
+
+    for pkg in plan.packages:
+        status = package_results.get(pkg)
+        if status is True:
+            package_details[pkg] = "installed"
+            installed_packages.append(pkg)
+        elif status is False:
+            package_details[pkg] = "missing"
+            missing_packages.append(pkg)
+            recommendations.append(f"package:{pkg}")
+        else:
+            package_details[pkg] = "unknown"
+            unknown_packages.append(pkg)
+
+    if missing_packages:
+        package_status = "missing"
+    elif unknown_packages:
+        package_status = "unknown"
+    else:
+        package_status = "ok"
+
+    return {
+        "sysctl": kernel_report,
+        "recommendations": recommendations,
+        "packages": {
+            "status": package_status,
+            "installed": installed_packages,
+            "missing": missing_packages,
+            "unknown": unknown_packages,
+            "details": package_details,
+        },
     return {
         "sysctl": kernel_report,
         "recommendations": recommendations,
