@@ -1,10 +1,19 @@
 #!/usr/bin/env python3
 """Oracle Linux tuning utility for Oracle Database workloads.
 
-This module replaces the legacy shell script with a modern, testable Python
-implementation.  It inspects the host resources and generates kernel and
-resource limits that follow current best practices for Oracle workloads on
-Oracle Linux 8+.
+This module offers two execution modes:
+
+``adaptive``
+    Generates Oracle best-practice kernel and resource limit settings based on
+    the current host resources.  This is the modernised workflow that replaces
+    the brittle imperative logic from the legacy shell implementation.
+
+``legacy``
+    Delegates the work to the original :mod:`oracle.sh` script so that
+    administrators can obtain byte-for-byte identical results compared to the
+    historically deployed automation.  This mode is useful when validating the
+    Python refactor or when a perfect reproduction of the legacy behaviour is
+    required.
 
 The script supports a dry-run mode (default) that only prints the calculated
 configuration.  Use the ``--apply`` flag to persist the configuration.
@@ -28,6 +37,48 @@ LOG = logging.getLogger(__name__)
 # Oracle recommends a dedicated user.  ``oracle`` is the conventional default,
 # but it can be overridden on the CLI.
 DEFAULT_ORACLE_USER = "oracle"
+LEGACY_SCRIPT_NAME = "oracle.sh"
+
+
+class LegacyRunner:
+    """Thin wrapper that executes the historical ``oracle.sh`` script.
+
+    Keeping the original shell implementation in-repo allows teams to validate
+    functional parity.  ``LegacyRunner`` automates its execution by piping the
+    required confirmation response so that it can be run unattended.
+    """
+
+    def __init__(self, script_path: Optional[pathlib.Path] = None) -> None:
+        if script_path is None:
+            script_path = pathlib.Path(__file__).with_name(LEGACY_SCRIPT_NAME)
+        self.script_path = script_path
+
+    def execute(self, apply_changes: bool, dry_run: bool) -> None:
+        LOG.debug("LegacyRunner invoked (apply=%s, dry_run=%s)", apply_changes, dry_run)
+        if dry_run:
+            if not self.script_path.exists():
+                LOG.warning("Legacy script %s is missing", self.script_path)
+            else:
+                LOG.info("[dry-run] Would execute legacy script %s", self.script_path)
+            return
+
+        ensure_root()
+        if not self.script_path.exists():
+            raise FileNotFoundError(f"Legacy script not found: {self.script_path}")
+
+        LOG.info("Executing legacy provisioning script %s", self.script_path)
+        result = subprocess.run(
+            ["/bin/bash", str(self.script_path)],
+            input="y\n",
+            text=True,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            LOG.error("Legacy script failed: %s", result.stderr.strip())
+            raise subprocess.CalledProcessError(result.returncode, result.args, result.stdout, result.stderr)
+        if result.stdout:
+            LOG.debug("legacy stdout: %s", result.stdout.strip())
+        LOG.info("Legacy provisioning completed successfully")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -364,6 +415,12 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         help="Persist the generated configuration (requires root).",
     )
     parser.add_argument(
+        "--mode",
+        choices=("adaptive", "legacy"),
+        default="adaptive",
+        help="Execution strategy: adaptive Python workflow or legacy shell script.",
+    )
+    parser.add_argument(
         "--verbose",
         action="count",
         default=0,
@@ -373,6 +430,11 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         "--output",
         type=pathlib.Path,
         help="Optional path to write the computed plan as JSON (dry-run safe).",
+    )
+    parser.add_argument(
+        "--legacy-script",
+        type=pathlib.Path,
+        help="Override path to oracle.sh when using legacy mode.",
     )
     return parser.parse_args(argv)
 
@@ -389,6 +451,13 @@ def configure_logging(verbosity: int) -> None:
 def main(argv: Optional[Iterable[str]] = None) -> int:
     args = parse_args(argv)
     configure_logging(args.verbose)
+
+    if args.mode == "legacy":
+        runner = LegacyRunner(args.legacy_script)
+        runner.execute(apply_changes=args.apply, dry_run=not args.apply)
+        if not args.apply:
+            LOG.info("Legacy dry-run completed. No changes were made.")
+        return 0
 
     inspector = SystemInspector()
     resources = inspector.collect()

@@ -1,5 +1,6 @@
 import pathlib
 import sys
+from unittest import mock
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -48,3 +49,18 @@ def test_plan_serialization(tmp_path):
     out_file = tmp_path / "plan.json"
     out_file.write_text(plan.describe(), encoding="utf-8")
     assert out_file.exists()
+
+
+def test_legacy_runner_invokes_shell(tmp_path):
+    legacy_script = tmp_path / "oracle.sh"
+    legacy_script.write_text("#!/bin/bash\necho legacy\n", encoding="utf-8")
+    runner = oracle_setup.LegacyRunner(legacy_script)
+
+    with mock.patch.object(oracle_setup, "ensure_root") as ensure_root_mock, mock.patch.object(
+        oracle_setup.subprocess, "run"
+    ) as run_mock:
+        ensure_root_mock.return_value = None
+        run_mock.return_value = mock.Mock(returncode=0, stdout="ok", stderr="")
+        runner.execute(apply_changes=True, dry_run=False)
+
+    run_mock.assert_called_once()
