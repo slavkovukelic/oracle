@@ -270,9 +270,11 @@ class SSHExecutor:
         remote_dir = (self.connection.remote_directory or ".").replace("\\", "/")
         remote_script_name = bundle.script_path.name
         remote_config_name = bundle.config_path.name
-        remote_bootstrap_name: Optional[str] = bundle.bootstrap_path.name if bundle.bootstrap_path else None
+        remote_bootstrap_name: Optional[str] = (
+            bundle.bootstrap_path.name if bundle.bootstrap_path else None
+        )
         uploaded_files: List[str] = [remote_script_name, remote_config_name]
-        if bundle.bootstrap_content is not None and remote_bootstrap_name:
+        if remote_bootstrap_name:
             uploaded_files.append(remote_bootstrap_name)
 
         mount_requested = bool(bundle.perform_mount)
@@ -294,17 +296,18 @@ class SSHExecutor:
             self._upload_file(sftp, remote_script, bundle.script_content)
             self._upload_file(sftp, remote_config, bundle.config_content)
 
-            if bundle.bootstrap_content is None or not remote_bootstrap_name:
-                raise RuntimeError("Bootstrap script is required but was not provided in the execution bundle.")
-
-            remote_bootstrap = (
-                posixpath.join(remote_dir, remote_bootstrap_name)
-                if remote_dir not in ("", ".")
-                else remote_bootstrap_name
-            )
-            self._upload_file(sftp, remote_bootstrap, bundle.bootstrap_content)
-            sftp.chmod(remote_bootstrap, 0o755)
-
+            if bundle.bootstrap_path is not None:
+                if bundle.bootstrap_content is None or not remote_bootstrap_name:
+                    raise RuntimeError(
+                        "Bootstrap script path was provided without corresponding content."
+                    )
+                remote_bootstrap = (
+                    posixpath.join(remote_dir, remote_bootstrap_name)
+                    if remote_dir not in ("", ".")
+                    else remote_bootstrap_name
+                )
+                self._upload_file(sftp, remote_bootstrap, bundle.bootstrap_content)
+                sftp.chmod(remote_bootstrap, 0o755)
             if bundle.script_path.suffix == ".sh":
                 sftp.chmod(remote_script, 0o755)
 
@@ -360,8 +363,16 @@ class SSHExecutor:
             except Exception as cleanup_exc:  # pragma: no cover - defensive logging
                 LOG.warning("Failed to clean up remote files: %s", cleanup_exc)
             client.close()
-            stdout_chunks.extend(cleanup_stdout)
-            stderr_chunks.extend(cleanup_stderr)
+            if cleanup_stdout:
+                LOG.debug(
+                    "Remote cleanup stdout: %s",
+                    b"".join(cleanup_stdout).decode("utf-8", errors="replace"),
+                )
+            if cleanup_stderr:
+                LOG.debug(
+                    "Remote cleanup stderr: %s",
+                    b"".join(cleanup_stderr).decode("utf-8", errors="replace"),
+                )
 
         stdout_bytes = b"".join(stdout_chunks)
         stderr_bytes = b"".join(stderr_chunks)
@@ -443,11 +454,6 @@ class SSHExecutor:
         return f"sudo umount {shlex.quote(mount_point)}"
 
     def _build_command(self, bundle: ExecutionBundle, remote_dir: str) -> str:
-        bootstrap_name = (
-            bundle.bootstrap_path.name
-            if bundle.bootstrap_path is not None
-            else bundle.script_path.name
-        )
         command_parts: List[str] = []
         if remote_dir not in ("", "."):
             command_parts.extend(["cd", shlex.quote(remote_dir), "&&"])
@@ -455,8 +461,21 @@ class SSHExecutor:
         for key, value in bundle.environment:
             command_parts.append(f"{key}={shlex.quote(value)}")
 
-        command_parts.append("bash")
-        command_parts.append(shlex.quote(bootstrap_name))
+        if bundle.bootstrap_path is not None:
+            target_name = bundle.bootstrap_path.name
+            interpreter = "bash"
+        else:
+            target_name = bundle.script_path.name
+            suffix = bundle.script_path.suffix.lower()
+            if suffix == ".py":
+                interpreter = "python3"
+            elif suffix == ".sh":
+                interpreter = "bash"
+            else:
+                interpreter = "bash"
+
+        command_parts.append(shlex.quote(interpreter))
+        command_parts.append(shlex.quote(target_name))
         for arg in bundle.arguments:
             command_parts.append(shlex.quote(arg))
         return " ".join(command_parts)

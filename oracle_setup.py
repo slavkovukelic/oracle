@@ -23,18 +23,44 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import datetime as _dt
-import grp
+try:
+    import grp
+except ModuleNotFoundError:  # pragma: no cover - Windows compatibility
+    class _UnsupportedGrpModule:
+        """Fallback shim for platforms without the ``grp`` module."""
+
+        @staticmethod
+        def _raise(*_args: object, **_kwargs: object) -> "NoReturn":
+            raise NotImplementedError("grp module is not available on this platform")
+
+        getgrnam = _raise
+        getgrgid = _raise
+        getgrall = _raise
+
+    grp = _UnsupportedGrpModule()  # type: ignore[assignment]
 import json
 import logging
 import os
 import pathlib
-import pwd
+try:
+    import pwd
+except ModuleNotFoundError:  # pragma: no cover - Windows compatibility
+    class _UnsupportedPwdModule:
+        """Fallback shim for platforms without the ``pwd`` module."""
+
+        @staticmethod
+        def _raise(*_args: object, **_kwargs: object) -> "NoReturn":
+            raise NotImplementedError("pwd module is not available on this platform")
+
+        getpwnam = _raise
+
+    pwd = _UnsupportedPwdModule()  # type: ignore[assignment]
 import re
 import shutil
 import subprocess
 import sys
 from abc import ABC, abstractmethod
-from typing import Callable, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, NoReturn, Optional, Tuple
 
 try:  # Python 3.11+
     import tomllib
