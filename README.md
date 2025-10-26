@@ -21,13 +21,17 @@
 
 ## Pokretanje
 
-Osnovni primer pokretanja (dry-run režim koji ne upisuje izmene):
+Prilikom pokretanja uvek koristite bootstrap skript koji obezbeđuje da je prisutan podržani Python interpreter:
 
 ```bash
-python oracle_setup.py
+./oracle_setup_bootstrap.sh
 ```
 
-Ukoliko želite da izmene budu primenjene na sistem, koristite `--apply` i pokrenite skript kao `root`.
+Skript najpre proverava verziju podrazumevanog `python3`. Ako je verzija 3.11 ili novija, direktno pokreće `oracle_setup.py`. U suprotnom pokušava da instalira `python3.11` pomoću `dnf`, a zatim pokreće alat sa novoinstaliranim interpreterom. Ukoliko želite da izmene budu primenjene na sistem, prosledite `--apply` i pokrenite skript kao `root`:
+
+```bash
+sudo ./oracle_setup_bootstrap.sh --apply
+```
 
 ## CLI opcije
 
