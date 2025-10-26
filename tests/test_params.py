@@ -38,6 +38,7 @@ def test_limits_include_memlock_for_hugepages():
 
 def test_plan_serialization(tmp_path):
     res = fake_resources(16)
+    plan = oracle_setup.build_plan(res, oracle_setup.DEFAULT_ORACLE_USER, fmw_user=None)
     kernel = oracle_setup.OracleKernelParameters.from_resources(res)
     limits = oracle_setup.OracleLimits.from_resources(res)
     plan = oracle_setup.ConfigurationPlan(res, kernel, limits, oracle_setup.DEFAULT_ORACLE_USER)
@@ -45,10 +46,25 @@ def test_plan_serialization(tmp_path):
     data = plan.to_dict()
     assert data["resources"]["mem_total_kb"] == res.mem_total_kb
     assert "kernel.shmmax" in data["kernel"]
+    assert "net.core.somaxconn" in data["kernel"]
+    assert "vm.dirty_bytes" in data["kernel"]
+    assert any(user["name"] == oracle_setup.DEFAULT_ORACLE_USER for user in data["users"])
 
     out_file = tmp_path / "plan.json"
     out_file.write_text(plan.describe(), encoding="utf-8")
     assert out_file.exists()
+
+
+def test_plan_includes_directories_and_files():
+    res = fake_resources(32)
+    plan = oracle_setup.build_plan(res, "oracle", fmw_user="fmw")
+
+    directory_paths = {str(spec.path) for spec in plan.directories}
+    file_paths = {str(spec.path) for spec in plan.files}
+
+    assert "/oradata" in directory_paths
+    assert "/etc/oraInst.loc" in file_paths
+    assert any(user.name == "fmw" for user in plan.users)
 
 
 def test_legacy_runner_invokes_shell(tmp_path):
@@ -64,3 +80,25 @@ def test_legacy_runner_invokes_shell(tmp_path):
         runner.execute(apply_changes=True, dry_run=False)
 
     run_mock.assert_called_once()
+
+
+def test_package_installation_invoked(monkeypatch):
+    res = fake_resources(8)
+    plan = oracle_setup.build_plan(res, "oracle", fmw_user=None)
+    plan.packages = ["pkg-one", "pkg-two"]
+    writer = oracle_setup.PlanWriter(dry_run=False)
+    provisioner = oracle_setup.Provisioner(plan, writer, dry_run=False)
+
+    monkeypatch.setattr(oracle_setup.shutil, "which", lambda name: "/usr/bin/dnf" if name == "dnf" else None)
+    run_calls = []
+
+    def fake_run(cmd, capture_output=True, text=True, check=False):
+        run_calls.append(cmd)
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(oracle_setup.subprocess, "run", fake_run)
+
+    provisioner.install_packages()
+
+    assert run_calls
+    assert run_calls[0][:3] == ["/usr/bin/dnf", "-y", "install"]

@@ -23,10 +23,12 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import datetime as _dt
+import grp
 import json
 import logging
 import os
 import pathlib
+import pwd
 import shutil
 import subprocess
 import sys
@@ -156,10 +158,25 @@ class OracleKernelParameters:
     kernel_sem: Tuple[int, int, int, int]
     fs_aio_max_nr: int
     fs_file_max: int
+    kernel_msgmnb: int
+    kernel_msgmni: int
+    kernel_msgmax: int
     net_core_rmem_default: int
     net_core_rmem_max: int
     net_core_wmem_default: int
     net_core_wmem_max: int
+    net_core_netdev_max_backlog: int
+    net_core_somaxconn: int
+    net_ipv4_ip_local_port_range: Tuple[int, int]
+    net_ipv4_tcp_fin_timeout: int
+    net_ipv4_tcp_keepalive_intvl: int
+    net_ipv4_tcp_keepalive_probes: int
+    net_ipv4_tcp_keepalive_time: int
+    net_ipv4_tcp_rmem: Tuple[int, int, int]
+    net_ipv4_tcp_wmem: Tuple[int, int, int]
+    vm_dirty_background_bytes: int
+    vm_dirty_bytes: int
+    vm_min_free_kbytes: int
     net_ipv4_ip_local_port_range: Tuple[int, int]
     net_ipv4_tcp_rmem: Tuple[int, int, int]
     net_ipv4_tcp_wmem: Tuple[int, int, int]
@@ -183,6 +200,35 @@ class OracleKernelParameters:
         aio_max_nr = max(1048576, res.cpu_count * 262144)
         file_max = max(6815744, res.cpu_count * 65536)
 
+        msgmnb = 65536
+        msgmni = max(32000, res.cpu_count * 2048)
+        msgmax = 65536
+
+        rmem_default = 262144
+        rmem_max = max(6291456, res.cpu_count * 1024 * 512)
+        wmem_default = 262144
+        wmem_max = max(6291456, res.cpu_count * 1024 * 512)
+
+        port_range = (9000, 65500)
+        tcp_fin_timeout = 30
+        tcp_keepalive_time = 600
+        tcp_keepalive_intvl = 30
+        tcp_keepalive_probes = 5
+        tcp_rmem = (4096, 87380, rmem_max)
+        tcp_wmem = (4096, 65536, wmem_max)
+
+        backlog = max(32768, res.cpu_count * 4096)
+        somaxconn = max(4096, res.cpu_count * 512)
+
+        swappiness = 10 if res.swap_total_gb > 0 else 1
+
+        dirty_background_bytes = _clamp_dirty_bytes(res.mem_total_bytes, low=134_217_728, pct=0.01)
+        dirty_bytes = max(
+            dirty_background_bytes * 2,
+            _clamp_dirty_bytes(res.mem_total_bytes, low=536_870_912, pct=0.04),
+        )
+
+        min_free_kbytes = max(67584, res.mem_total_kb // 64)
         rmem_default = 262144
         rmem_max = max(4194304, res.cpu_count * 1024 * 256)
         wmem_default = 262144
@@ -212,10 +258,25 @@ class OracleKernelParameters:
             kernel_sem=(semmsl, semmns, semopm, semmni),
             fs_aio_max_nr=aio_max_nr,
             fs_file_max=file_max,
+            kernel_msgmnb=msgmnb,
+            kernel_msgmni=msgmni,
+            kernel_msgmax=msgmax,
             net_core_rmem_default=rmem_default,
             net_core_rmem_max=rmem_max,
             net_core_wmem_default=wmem_default,
             net_core_wmem_max=wmem_max,
+            net_core_netdev_max_backlog=backlog,
+            net_core_somaxconn=somaxconn,
+            net_ipv4_ip_local_port_range=port_range,
+            net_ipv4_tcp_fin_timeout=tcp_fin_timeout,
+            net_ipv4_tcp_keepalive_intvl=tcp_keepalive_intvl,
+            net_ipv4_tcp_keepalive_probes=tcp_keepalive_probes,
+            net_ipv4_tcp_keepalive_time=tcp_keepalive_time,
+            net_ipv4_tcp_rmem=tcp_rmem,
+            net_ipv4_tcp_wmem=tcp_wmem,
+            vm_dirty_background_bytes=dirty_background_bytes,
+            vm_dirty_bytes=dirty_bytes,
+            vm_min_free_kbytes=min_free_kbytes,
             net_ipv4_ip_local_port_range=port_range,
             net_ipv4_tcp_rmem=tcp_rmem,
             net_ipv4_tcp_wmem=tcp_wmem,
@@ -235,12 +296,27 @@ class OracleKernelParameters:
             "kernel.shmall": str(self.kernel_shmall),
             "kernel.shmmni": str(self.kernel_shmmni),
             "kernel.sem": sem,
+            "kernel.msgmnb": str(self.kernel_msgmnb),
+            "kernel.msgmni": str(self.kernel_msgmni),
+            "kernel.msgmax": str(self.kernel_msgmax),
             "fs.aio-max-nr": str(self.fs_aio_max_nr),
             "fs.file-max": str(self.fs_file_max),
             "net.core.rmem_default": str(self.net_core_rmem_default),
             "net.core.rmem_max": str(self.net_core_rmem_max),
             "net.core.wmem_default": str(self.net_core_wmem_default),
             "net.core.wmem_max": str(self.net_core_wmem_max),
+            "net.core.netdev_max_backlog": str(self.net_core_netdev_max_backlog),
+            "net.core.somaxconn": str(self.net_core_somaxconn),
+            "net.ipv4.ip_local_port_range": port_range,
+            "net.ipv4.tcp_fin_timeout": str(self.net_ipv4_tcp_fin_timeout),
+            "net.ipv4.tcp_keepalive_intvl": str(self.net_ipv4_tcp_keepalive_intvl),
+            "net.ipv4.tcp_keepalive_probes": str(self.net_ipv4_tcp_keepalive_probes),
+            "net.ipv4.tcp_keepalive_time": str(self.net_ipv4_tcp_keepalive_time),
+            "net.ipv4.tcp_rmem": tcp_rmem,
+            "net.ipv4.tcp_wmem": tcp_wmem,
+            "vm.dirty_background_bytes": str(self.vm_dirty_background_bytes),
+            "vm.dirty_bytes": str(self.vm_dirty_bytes),
+            "vm.min_free_kbytes": str(self.vm_min_free_kbytes),
             "net.ipv4.ip_local_port_range": port_range,
             "net.ipv4.tcp_rmem": tcp_rmem,
             "net.ipv4.tcp_wmem": tcp_wmem,
@@ -299,11 +375,14 @@ class PlanWriter:
     def __init__(self, dry_run: bool = True) -> None:
         self.dry_run = dry_run
 
+    def write_file(self, path: pathlib.Path, content: str, mode: Optional[int] = None) -> None:
     def write_file(self, path: pathlib.Path, content: str) -> None:
         timestamp = _dt.datetime.now().strftime("%Y%m%d%H%M%S")
         if self.dry_run:
             LOG.info("[dry-run] Would write %s", path)
             LOG.debug("Content for %s:\n%s", path, content)
+            if mode is not None:
+                LOG.debug("[dry-run] Desired mode for %s: %s", path, oct(mode))
             return
 
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -313,17 +392,21 @@ class PlanWriter:
             LOG.info("Created backup %s", backup)
         with path.open("w", encoding="utf-8") as fh:
             fh.write(content)
+        if mode is not None:
+            os.chmod(path, mode)
         LOG.info("Wrote %s", path)
 
     def apply_sysctl(self, params: Dict[str, str], sysctl_path: pathlib.Path) -> None:
         header = "# Generated by oracle_setup.py on %s\n" % _dt.datetime.now().isoformat()
         body = "\n".join(f"{k} = {v}" for k, v in sorted(params.items()))
+        self.write_file(sysctl_path, header + body + "\n", mode=0o644)
         self.write_file(sysctl_path, header + body + "\n")
         if not self.dry_run:
             run_command(["sysctl", "--system"], check=False)
 
     def apply_limits(self, content: str, limits_path: pathlib.Path) -> None:
         header = "# Oracle limits generated on %s\n" % _dt.datetime.now().isoformat()
+        self.write_file(limits_path, header + content, mode=0o644)
         self.write_file(limits_path, header + content)
 
 
@@ -362,6 +445,48 @@ RECOMMENDED_PACKAGES = {
 }
 
 
+@dataclasses.dataclass(frozen=True)
+class GroupSpec:
+    """Definition of a system group that should exist."""
+
+    name: str
+    gid: Optional[int] = None
+
+
+@dataclasses.dataclass(frozen=True)
+class UserSpec:
+    """Definition of a managed system user."""
+
+    name: str
+    primary_group: str
+    supplementary_groups: Tuple[str, ...]
+    home: pathlib.Path
+    shell: str = "/bin/bash"
+    uid: Optional[int] = None
+    create_home: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
+class DirectorySpec:
+    """Directory that must exist with ownership and permissions."""
+
+    path: pathlib.Path
+    owner: str
+    group: str
+    mode: int = 0o775
+
+
+@dataclasses.dataclass(frozen=True)
+class FileSpec:
+    """File that should be rendered with specific ownership and mode."""
+
+    path: pathlib.Path
+    content: str
+    owner: str = "root"
+    group: str = "root"
+    mode: int = 0o644
+
+
 def _calculate_hugepages(res: ResourceSummary) -> int:
     """Estimate HugePages count based on RAM.
 
@@ -375,12 +500,36 @@ def _calculate_hugepages(res: ResourceSummary) -> int:
     return mem_for_sga_kb // res.hugepage_size_kb
 
 
+def _clamp_dirty_bytes(total_bytes: int, low: int, pct: float) -> int:
+    """Clamp dirty memory thresholds for modern kernels.
+
+    ``pct`` controls the default ratio relative to RAM while ``low`` provides a
+    floor recommended by current Oracle Linux guidance for database hosts.
+    Values are rounded to the nearest multiple of 4 KiB so they align with
+    kernel expectations.
+    """
+
+    computed = int(total_bytes * pct)
+    value = max(low, computed)
+    # Align to 4 KiB pages to avoid sysctl warnings.
+    page = 4096
+    remainder = value % page
+    if remainder:
+        value += page - remainder
+    return value
+
+
 @dataclasses.dataclass
 class ConfigurationPlan:
     resources: ResourceSummary
     kernel: OracleKernelParameters
     limits: OracleLimits
     oracle_user: str
+    groups: List[GroupSpec]
+    users: List[UserSpec]
+    directories: List[DirectorySpec]
+    files: List[FileSpec]
+    packages: List[str]
 
     def to_dict(self) -> Dict[str, object]:
         return {
@@ -388,6 +537,26 @@ class ConfigurationPlan:
             "kernel": self.kernel.as_sysctl_dict(),
             "limits": dataclasses.asdict(self.limits),
             "oracle_user": self.oracle_user,
+            "groups": [dataclasses.asdict(group) for group in self.groups],
+            "users": [
+                {
+                    **dataclasses.asdict(user),
+                    "home": str(user.home),
+                    "supplementary_groups": list(user.supplementary_groups),
+                }
+                for user in self.users
+            ],
+            "directories": [
+                {
+                    **dataclasses.asdict(directory),
+                    "path": str(directory.path),
+                }
+                for directory in self.directories
+            ],
+            "files": [
+                {**dataclasses.asdict(file_spec), "path": str(file_spec.path)} for file_spec in self.files
+            ],
+            "packages": list(self.packages),
             "packages": sorted(RECOMMENDED_PACKAGES),
         }
 
@@ -402,6 +571,312 @@ class ConfigurationPlan:
         writer.apply_limits(self.limits.render(self.oracle_user), limits_path)
 
 
+def _render_oracle_profile(user: UserSpec, data_dir: pathlib.Path) -> str:
+    oracle_base = user.home / "base"
+    oracle_home = oracle_base / "dbhome"
+    tns_admin = oracle_home / "network" / "admin"
+    return (
+        f"# Oracle environment for {user.name}\n"
+        f"export ORACLE_BASE={oracle_base}\n"
+        f"export ORACLE_HOME={oracle_home}\n"
+        "export ORACLE_SID=ORCLCDB\n"
+        "export ORACLE_TERM=xterm\n"
+        "export NLS_DATE_FORMAT='YYYY-MM-DD:HH24:MI:SS'\n"
+        f"export TNS_ADMIN={tns_admin}\n"
+        f"export ORACLE_PATH={data_dir}\n"
+        "export LD_LIBRARY_PATH=$ORACLE_HOME/lib\n"
+        "export PATH=$ORACLE_HOME/bin:$PATH\n"
+        "export ORAENV_ASK=NO\n"
+    )
+
+
+def _render_fmw_profile(user: UserSpec) -> str:
+    mw_home = user.home / "mwhome"
+    node_manager = user.home / "mwlog" / "nodemanager"
+    return (
+        f"# Fusion Middleware environment for {user.name}\n"
+        f"export MW_HOME={mw_home}\n"
+        f"export NODEMGR_HOME={node_manager}\n"
+        "export PATH=$MW_HOME/bin:$PATH\n"
+    )
+
+
+def _render_bash_profile_include(script_name: pathlib.Path) -> str:
+    return (
+        "# ~/.bash_profile generated by oracle_setup.py\n"
+        "umask 027\n"
+        "if [ -f ~/.bashrc ]; then\n"
+        "  . ~/.bashrc\n"
+        "fi\n"
+        f"if [ -f {script_name} ]; then\n"
+        f"  . {script_name}\n"
+        "fi\n"
+    )
+
+
+def _oracle_directories(user: UserSpec) -> List[DirectorySpec]:
+    inventory_group = "oinstall" if "oinstall" in user.supplementary_groups else user.primary_group
+    base = user.home
+    directories = [
+        DirectorySpec(base, owner=user.name, group=user.primary_group, mode=0o750),
+        DirectorySpec(base / "base", owner=user.name, group=user.primary_group, mode=0o750),
+        DirectorySpec(base / "base" / "dbhome", owner=user.name, group=user.primary_group, mode=0o750),
+        DirectorySpec(base / "INSTALL", owner=user.name, group=user.primary_group),
+        DirectorySpec(base / "oraInventory", owner=user.name, group=inventory_group, mode=0o770),
+        DirectorySpec(base / "ubin", owner=user.name, group=user.primary_group),
+        DirectorySpec(base / "utils", owner=user.name, group=user.primary_group),
+        DirectorySpec(base / "sys_sql", owner=user.name, group=user.primary_group),
+        DirectorySpec(base / "tmp", owner=user.name, group=user.primary_group, mode=0o770),
+    ]
+    return directories
+
+
+def _fmw_directories(user: UserSpec) -> List[DirectorySpec]:
+    base = user.home
+    return [
+        DirectorySpec(base, owner=user.name, group=user.primary_group, mode=0o750),
+        DirectorySpec(base / "INSTALL", owner=user.name, group=user.primary_group),
+        DirectorySpec(base / "mwlog", owner=user.name, group=user.primary_group),
+        DirectorySpec(base / "ubin", owner=user.name, group=user.primary_group),
+        DirectorySpec(base / "utils", owner=user.name, group=user.primary_group),
+        DirectorySpec(base / "mwhome", owner=user.name, group=user.primary_group, mode=0o750),
+        DirectorySpec(base / "tmp", owner=user.name, group=user.primary_group, mode=0o770),
+        DirectorySpec(base / "oraInventory", owner=user.name, group="oinstall", mode=0o770),
+    ]
+
+
+def _oracle_files(user: UserSpec, data_dir: pathlib.Path) -> List[FileSpec]:
+    profile_path = pathlib.Path("/etc/profile.d") / f"{user.name}_oracle.sh"
+    bash_profile_path = user.home / ".bash_profile"
+    files = [
+        FileSpec(
+            path=profile_path,
+            content=_render_oracle_profile(user, data_dir),
+            owner="root",
+            group="root",
+            mode=0o644,
+        ),
+        FileSpec(
+            path=bash_profile_path,
+            content=_render_bash_profile_include(profile_path),
+            owner=user.name,
+            group=user.primary_group,
+            mode=0o640,
+        ),
+    ]
+    return files
+
+
+def _fmw_files(user: UserSpec) -> List[FileSpec]:
+    profile_path = pathlib.Path("/etc/profile.d") / f"{user.name}_fmw.sh"
+    bash_profile_path = user.home / ".bash_profile"
+    files = [
+        FileSpec(
+            path=profile_path,
+            content=_render_fmw_profile(user),
+            owner="root",
+            group="root",
+            mode=0o644,
+        ),
+        FileSpec(
+            path=bash_profile_path,
+            content=_render_bash_profile_include(profile_path),
+            owner=user.name,
+            group=user.primary_group,
+            mode=0o640,
+        ),
+    ]
+    return files
+
+
+def _ora_inventory_file(user: UserSpec) -> FileSpec:
+    content = (
+        f"inventory_loc={user.home / 'oraInventory'}\n"
+        f"inst_group={user.primary_group}\n"
+    )
+    return FileSpec(path=pathlib.Path("/etc/oraInst.loc"), content=content, owner="root", group="oinstall", mode=0o664)
+
+
+def _oratab_file() -> FileSpec:
+    content = (
+        "# /etc/oratab generated by oracle_setup.py\n"
+        "# Populate this file after creating Oracle databases.\n"
+    )
+    return FileSpec(path=pathlib.Path("/etc/oratab"), content=content, owner="root", group="root", mode=0o664)
+
+
+def build_plan(resources: ResourceSummary, oracle_user: str, fmw_user: Optional[str] = "fmw") -> ConfigurationPlan:
+    kernel = OracleKernelParameters.from_resources(resources)
+    limits = OracleLimits.from_resources(resources)
+
+    groups = [GroupSpec("oinstall"), GroupSpec("dba")]
+    users: List[UserSpec] = [
+        UserSpec(
+            name=oracle_user,
+            primary_group="dba",
+            supplementary_groups=("oinstall",),
+            home=pathlib.Path(f"/{oracle_user}"),
+        )
+    ]
+
+    directories: List[DirectorySpec] = []
+    files: List[FileSpec] = []
+
+    data_dir = pathlib.Path("/oradata")
+    directories.extend(_oracle_directories(users[0]))
+    directories.append(DirectorySpec(data_dir, owner=oracle_user, group="dba", mode=0o770))
+    files.extend(_oracle_files(users[0], data_dir))
+    files.append(_ora_inventory_file(users[0]))
+    files.append(_oratab_file())
+
+    if fmw_user:
+        fmw_spec = UserSpec(
+            name=fmw_user,
+            primary_group="dba",
+            supplementary_groups=("oinstall",),
+            home=pathlib.Path(f"/{fmw_user}"),
+        )
+        users.append(fmw_spec)
+        directories.extend(_fmw_directories(fmw_spec))
+        files.extend(_fmw_files(fmw_spec))
+
+    packages = sorted(RECOMMENDED_PACKAGES)
+
+    return ConfigurationPlan(
+        resources=resources,
+        kernel=kernel,
+        limits=limits,
+        oracle_user=oracle_user,
+        groups=groups,
+        users=users,
+        directories=directories,
+        files=files,
+        packages=packages,
+    )
+
+
+class PackageManager:
+    """Simple wrapper around the system package manager."""
+
+    def __init__(self, dry_run: bool) -> None:
+        self.dry_run = dry_run
+        self.executable = shutil.which("dnf") or shutil.which("yum")
+
+    def install(self, packages: List[str]) -> None:
+        if not packages:
+            return
+        unique_packages = sorted(set(packages))
+        if not self.executable:
+            if self.dry_run:
+                LOG.warning(
+                    "Package manager (dnf/yum) not available; would install: %s",
+                    ", ".join(unique_packages),
+                )
+                return
+            raise FileNotFoundError("Neither dnf nor yum package manager is available on this system")
+
+        cmd = [self.executable, "-y", "install", *unique_packages]
+        if self.dry_run:
+            LOG.info("[dry-run] Would install packages: %s", ", ".join(unique_packages))
+            return
+        run_command(cmd)
+
+
+class Provisioner:
+    """Apply the configuration plan to the host system."""
+
+    def __init__(self, plan: ConfigurationPlan, writer: PlanWriter, dry_run: bool) -> None:
+        self.plan = plan
+        self.writer = writer
+        self.dry_run = dry_run
+
+    def apply(self) -> None:
+        self.ensure_groups()
+        self.ensure_users()
+        self.ensure_directories()
+        self.write_files()
+        self.install_packages()
+
+    def ensure_groups(self) -> None:
+        for spec in self.plan.groups:
+            try:
+                existing = grp.getgrnam(spec.name)
+            except KeyError:
+                if self.dry_run:
+                    LOG.info("[dry-run] Would create group %s", spec.name)
+                    continue
+                cmd = ["groupadd"]
+                if spec.gid is not None:
+                    cmd.extend(["-g", str(spec.gid)])
+                cmd.append(spec.name)
+                run_command(cmd)
+                LOG.info("Created group %s", spec.name)
+            else:
+                if spec.gid is not None and existing.gr_gid != spec.gid:
+                    LOG.warning(
+                        "Group %s already exists with gid %s (expected %s)",
+                        spec.name,
+                        existing.gr_gid,
+                        spec.gid,
+                    )
+
+    def ensure_users(self) -> None:
+        for spec in self.plan.users:
+            try:
+                pwd.getpwnam(spec.name)
+            except KeyError:
+                if self.dry_run:
+                    LOG.info("[dry-run] Would create user %s", spec.name)
+                    continue
+                cmd = ["useradd", "-g", spec.primary_group]
+                if spec.uid is not None:
+                    cmd.extend(["-u", str(spec.uid)])
+                if spec.supplementary_groups:
+                    cmd.extend(["-G", ",".join(spec.supplementary_groups)])
+                cmd.extend(["-d", str(spec.home), "-s", spec.shell])
+                if spec.create_home:
+                    cmd.append("-m")
+                else:
+                    cmd.append("-M")
+                cmd.append(spec.name)
+                run_command(cmd)
+                LOG.info("Created user %s", spec.name)
+            else:
+                LOG.info("User %s already exists; skipping creation", spec.name)
+
+    def ensure_directories(self) -> None:
+        for spec in self.plan.directories:
+            if self.dry_run:
+                LOG.info(
+                    "[dry-run] Would ensure directory %s owned by %s:%s", spec.path, spec.owner, spec.group
+                )
+                continue
+            spec.path.mkdir(parents=True, exist_ok=True)
+            uid = pwd.getpwnam(spec.owner).pw_uid
+            gid = grp.getgrnam(spec.group).gr_gid
+            os.chown(spec.path, uid, gid)
+            os.chmod(spec.path, spec.mode)
+            LOG.info("Ensured directory %s", spec.path)
+
+    def write_files(self) -> None:
+        for spec in self.plan.files:
+            self.writer.write_file(spec.path, spec.content, mode=spec.mode)
+            if self.dry_run:
+                LOG.info(
+                    "[dry-run] Would set ownership of %s to %s:%s", spec.path, spec.owner, spec.group
+                )
+                continue
+            uid = pwd.getpwnam(spec.owner).pw_uid
+            gid = grp.getgrnam(spec.group).gr_gid
+            os.chown(spec.path, uid, gid)
+            os.chmod(spec.path, spec.mode)
+            LOG.info("Configured %s", spec.path)
+
+    def install_packages(self) -> None:
+        manager = PackageManager(self.dry_run)
+        manager.install(self.plan.packages)
+
+
 def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -413,6 +888,16 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         "--apply",
         action="store_true",
         help="Persist the generated configuration (requires root).",
+    )
+    parser.add_argument(
+        "--fmw-user",
+        default="fmw",
+        help="Optional Fusion Middleware user to manage (use --no-fmw to disable).",
+    )
+    parser.add_argument(
+        "--no-fmw",
+        action="store_true",
+        help="Skip creating the Fusion Middleware account and directories.",
     )
     parser.add_argument(
         "--mode",
@@ -461,6 +946,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
     inspector = SystemInspector()
     resources = inspector.collect()
+    fmw_user = None if args.no_fmw else (args.fmw_user or None)
+    plan = build_plan(resources, args.oracle_user, fmw_user)
     kernel = OracleKernelParameters.from_resources(resources)
     limits = OracleLimits.from_resources(resources)
     plan = ConfigurationPlan(resources=resources, kernel=kernel, limits=limits, oracle_user=args.oracle_user)
@@ -472,6 +959,12 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         LOG.info("Wrote plan JSON to %s", args.output)
 
     writer = PlanWriter(dry_run=not args.apply)
+    provisioner = Provisioner(plan, writer, dry_run=not args.apply)
+    if args.apply:
+        ensure_root()
+    provisioner.apply()
+    plan.persist(writer)
+    if args.apply:
     if args.apply:
         ensure_root()
         plan.persist(writer)
