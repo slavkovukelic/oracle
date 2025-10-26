@@ -1127,10 +1127,17 @@ class AptManager(PackageManager):
 class Provisioner:
     """Apply the configuration plan to the host system."""
 
-    def __init__(self, plan: ConfigurationPlan, writer: PlanWriter, dry_run: bool) -> None:
+    def __init__(
+        self,
+        plan: ConfigurationPlan,
+        writer: PlanWriter,
+        dry_run: bool,
+        update_existing_users: bool = False,
+    ) -> None:
         self.plan = plan
         self.writer = writer
         self.dry_run = dry_run
+        self.update_existing_users = update_existing_users
 
     def apply(self) -> None:
         self.ensure_groups()
@@ -1165,7 +1172,7 @@ class Provisioner:
     def ensure_users(self) -> None:
         for spec in self.plan.users:
             try:
-                pwd.getpwnam(spec.name)
+                existing = pwd.getpwnam(spec.name)
             except KeyError:
                 if self.dry_run:
                     LOG.info("[dry-run] Would create user %s", spec.name)
@@ -1184,7 +1191,59 @@ class Provisioner:
                 run_command(cmd)
                 LOG.info("Created user %s", spec.name)
             else:
-                LOG.info("User %s already exists; skipping creation", spec.name)
+                if not self.update_existing_users:
+                    LOG.info("User %s already exists; skipping creation", spec.name)
+                    continue
+
+                updates: List[str] = []
+                usermod_cmd = ["usermod"]
+
+                if spec.uid is not None and existing.pw_uid != spec.uid:
+                    usermod_cmd.extend(["-u", str(spec.uid)])
+                    updates.append(f"uid -> {spec.uid}")
+
+                primary_group = grp.getgrgid(existing.pw_gid).gr_name
+                if primary_group != spec.primary_group:
+                    usermod_cmd.extend(["-g", spec.primary_group])
+                    updates.append(f"primary group -> {spec.primary_group}")
+
+                desired_groups = set(spec.supplementary_groups)
+                current_groups = {
+                    group.gr_name
+                    for group in grp.getgrall()
+                    if spec.name in group.gr_mem
+                }
+                if desired_groups != current_groups:
+                    group_list = ",".join(sorted(desired_groups))
+                    usermod_cmd.extend(["-G", group_list])
+                    label = group_list or "(none)"
+                    updates.append(f"supplementary groups -> {label}")
+
+                if existing.pw_shell != spec.shell:
+                    usermod_cmd.extend(["-s", spec.shell])
+                    updates.append(f"shell -> {spec.shell}")
+
+                if pathlib.Path(existing.pw_dir) != spec.home:
+                    usermod_cmd.extend(["-d", str(spec.home)])
+                    if spec.create_home:
+                        usermod_cmd.append("-m")
+                    updates.append(f"home -> {spec.home}")
+
+                if not updates:
+                    LOG.info("User %s already matches desired configuration", spec.name)
+                    continue
+
+                usermod_cmd.append(spec.name)
+                if self.dry_run:
+                    LOG.info(
+                        "[dry-run] Would update user %s: %s",
+                        spec.name,
+                        "; ".join(updates),
+                    )
+                    continue
+
+                run_command(usermod_cmd)
+                LOG.info("Updated user %s (%s)", spec.name, "; ".join(updates))
 
     def ensure_directories(self) -> None:
         for spec in self.plan.directories:
@@ -1275,6 +1334,17 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         help="Increase logging verbosity (use -vv for debug).",
     )
     parser.add_argument(
+        "--log-file",
+        type=pathlib.Path,
+        help="Optional path to write logs in addition to the console output.",
+    )
+    parser.add_argument(
+        "--log-format",
+        choices=("text", "json"),
+        default="text",
+        help="Logging output format (default: text).",
+    )
+    parser.add_argument(
         "--output",
         type=pathlib.Path,
         help="Optional path to write the computed plan as JSON (dry-run safe).",
@@ -1289,21 +1359,63 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         type=pathlib.Path,
         help="Path to a TOML configuration file describing packages, users, and directories.",
     )
+    parser.add_argument(
+        "--update-existing-users",
+        action="store_true",
+        help="Align existing user accounts with the desired configuration.",
+    )
     return parser.parse_args(argv)
 
 
-def configure_logging(verbosity: int) -> None:
+class _JSONLogFormatter(logging.Formatter):
+    """Format log records as JSON objects."""
+
+    def format(self, record: logging.LogRecord) -> str:  # noqa: D401 - brief output
+        payload = {
+            "timestamp": _dt.datetime.utcfromtimestamp(record.created).isoformat() + "Z",
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        if record.exc_info:
+            payload["exc_info"] = self.formatException(record.exc_info)
+        return json.dumps(payload)
+
+
+def configure_logging(verbosity: int, log_file: Optional[pathlib.Path], log_format: str) -> None:
     level = logging.WARNING
     if verbosity == 1:
         level = logging.INFO
     elif verbosity >= 2:
         level = logging.DEBUG
-    logging.basicConfig(level=level, format="%(levelname)s: %(message)s")
+    root = logging.getLogger()
+    root.setLevel(level)
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+
+    if log_file is not None:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    if log_format == "json":
+        formatter: logging.Formatter = _JSONLogFormatter()
+    else:
+        formatter = logging.Formatter("%(levelname)s: %(message)s")
+
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(level)
+    console_handler.setFormatter(formatter)
+    root.addHandler(console_handler)
+
+    if log_file is not None:
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setLevel(level)
+        file_handler.setFormatter(formatter)
+        root.addHandler(file_handler)
 
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
     args = parse_args(argv)
-    configure_logging(args.verbose)
+    configure_logging(args.verbose, args.log_file, args.log_format)
 
     if args.mode == "legacy":
         runner = LegacyRunner(args.legacy_script)
@@ -1331,7 +1443,12 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         LOG.info("Inspection report:\n%s", json.dumps(inspection, indent=2))
 
     writer = PlanWriter(dry_run=not args.apply)
-    provisioner = Provisioner(plan, writer, dry_run=not args.apply)
+    provisioner = Provisioner(
+        plan,
+        writer,
+        dry_run=not args.apply,
+        update_existing_users=args.update_existing_users,
+    )
 
     if args.apply:
         ensure_root()
