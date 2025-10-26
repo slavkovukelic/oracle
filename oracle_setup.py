@@ -32,7 +32,7 @@ import pwd
 import shutil
 import subprocess
 import sys
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 LOG = logging.getLogger(__name__)
 
@@ -496,6 +496,59 @@ def _clamp_dirty_bytes(total_bytes: int, low: int, pct: float) -> int:
     return value
 
 
+def _normalize_whitespace(value: str) -> str:
+    return " ".join(value.split())
+
+
+def read_sysctl_value(key: str) -> Optional[str]:
+    """Read the current sysctl value for ``key`` from ``/proc/sys``.
+
+    Returns ``None`` when the kernel parameter is not present on the host.
+    """
+
+    path = pathlib.Path("/proc/sys") / key.replace(".", "/")
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    return _normalize_whitespace(raw)
+
+
+def inspect_current_system(
+    plan: "ConfigurationPlan", sysctl_reader: Optional[Callable[[str], Optional[str]]] = None
+) -> Dict[str, object]:
+    """Compare the live system state with the recommended configuration plan.
+
+    ``sysctl_reader`` exists primarily for unit testing and allows callers to
+    override how kernel parameters are retrieved.
+    """
+
+    reader = sysctl_reader or read_sysctl_value
+    kernel_report: Dict[str, Dict[str, str]] = {}
+
+    for key, recommended in plan.kernel.as_sysctl_dict().items():
+        current = reader(key)
+        normalized_recommended = _normalize_whitespace(recommended)
+        if current is None:
+            status = "missing"
+        elif current == normalized_recommended:
+            status = "ok"
+        else:
+            status = "needs_update"
+        kernel_report[key] = {
+            "current": current,
+            "recommended": normalized_recommended,
+            "status": status,
+        }
+
+    recommendations = [key for key, data in kernel_report.items() if data["status"] != "ok"]
+
+    return {
+        "sysctl": kernel_report,
+        "recommendations": recommendations,
+    }
+
+
 @dataclasses.dataclass
 class ConfigurationPlan:
     resources: ResourceSummary
@@ -882,6 +935,14 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         help="Execution strategy: adaptive Python workflow or legacy shell script.",
     )
     parser.add_argument(
+        "--inspect",
+        action="store_true",
+        help=(
+            "Inspect the current system configuration and highlight differences from the"
+            " recommended plan."
+        ),
+    )
+    parser.add_argument(
         "--verbose",
         action="count",
         default=0,
@@ -931,6 +992,10 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     if args.output:
         args.output.write_text(plan_summary, encoding="utf-8")
         LOG.info("Wrote plan JSON to %s", args.output)
+
+    if args.inspect:
+        inspection = inspect_current_system(plan)
+        LOG.info("Inspection report:\n%s", json.dumps(inspection, indent=2))
 
     writer = PlanWriter(dry_run=not args.apply)
     provisioner = Provisioner(plan, writer, dry_run=not args.apply)
