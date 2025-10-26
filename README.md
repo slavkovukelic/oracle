@@ -33,6 +33,14 @@ Skript najpre proverava verziju podrazumevanog `python3`. Ako je verzija 3.11 il
 sudo ./oracle_setup_bootstrap.sh --apply
 ```
 
+Bootstrap skript podržava i rad u okruženjima bez pristupa internetu. Ponašanje se podešava preko sledećih promenljivih okruženja:
+
+- `ORACLE_BOOTSTRAP_REPO_MODE` – vrednosti `system`, `local` ili `auto` (podrazumevano). U `system` režimu koristi se samo postojeć
+  e mrežne riznice, `local` prisiljava korišćenje lokalnog medija, dok `auto` prvo pokušava mrežnu instalaciju, a zatim prelazi na
+  lokalnu.
+- `ORACLE_BOOTSTRAP_LOCAL_REPO` – putanja do montiranog Oracle Linux ISO medija (podrazumevano `/INSTALL`). Skript očekuje `AppStr
+  eam` i `BaseOS` poddirektorijume i, ukoliko su dostupni, privremeno konfiguriše `dnf` da ih koristi.
+
 ## CLI opcije
 
 Sve dostupne CLI opcije možete kombinovati po potrebi:
