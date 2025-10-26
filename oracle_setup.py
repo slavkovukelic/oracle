@@ -29,6 +29,7 @@ import logging
 import os
 import pathlib
 import pwd
+import re
 import shutil
 import subprocess
 import sys
@@ -422,6 +423,24 @@ class PathSettings:
 
 
 @dataclasses.dataclass(frozen=True)
+class DatabaseSettings:
+    """Oracle Database release targeted by the provisioning workflow."""
+
+    target_version: str = "19c"
+
+    @property
+    def major_release(self) -> Optional[int]:
+        match = re.match(r"^(\d+)", self.target_version.strip().lower())
+        if match:
+            return int(match.group(1))
+        return None
+
+    def is_legacy_release(self) -> bool:
+        major = self.major_release
+        return major is not None and major <= 12
+
+
+@dataclasses.dataclass(frozen=True)
 class SetupConfig:
     """Configuration loaded from a TOML manifest."""
 
@@ -429,6 +448,7 @@ class SetupConfig:
     groups: Tuple[GroupSpec, ...]
     users: Dict[str, UserSpec]
     paths: PathSettings
+    database: DatabaseSettings = dataclasses.field(default_factory=DatabaseSettings)
 
     def get_user(self, name: str) -> UserSpec:
         try:
@@ -523,7 +543,24 @@ class SetupConfig:
         except KeyError as exc:
             raise KeyError(f"Missing required path setting: {exc.args[0]}") from exc
 
-        return cls(packages=packages, groups=tuple(groups), users=users, paths=paths)
+        database_section = data.get("database")
+        if database_section is None:
+            database = DatabaseSettings()
+        elif isinstance(database_section, Mapping):
+            target_version = database_section.get("target_version", DatabaseSettings().target_version)
+            if not isinstance(target_version, str):
+                raise TypeError("database.target_version must be a string")
+            database = DatabaseSettings(target_version=target_version)
+        else:
+            raise TypeError("[database] section must be a table if provided")
+
+        return cls(
+            packages=packages,
+            groups=tuple(groups),
+            users=users,
+            paths=paths,
+            database=database,
+        )
 
 
 DEFAULT_CONFIG_PATH = pathlib.Path(__file__).with_name("oracle_setup.toml")
@@ -538,6 +575,38 @@ def load_setup_config(path: Optional[pathlib.Path] = None) -> SetupConfig:
     if not isinstance(data, Mapping):
         raise TypeError("Configuration root must be a table")
     return SetupConfig.from_mapping(data)
+
+
+def detect_oracle_linux_major_version(
+    os_release_path: pathlib.Path = pathlib.Path("/etc/os-release"),
+) -> Optional[int]:
+    """Return the Oracle Linux major release version when available."""
+
+    try:
+        contents = os_release_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+
+    data: Dict[str, str] = {}
+    for line in contents.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        data[key] = value.strip().strip('"')
+
+    id_value = data.get("ID", "").lower()
+    name_value = data.get("NAME", "").lower()
+    id_like = data.get("ID_LIKE", "").lower().split()
+
+    if "oracle" not in name_value and id_value not in {"ol", "oracle"} and "ol" not in id_like:
+        return None
+
+    version_id = data.get("VERSION_ID", "")
+    match = re.match(r"^(\d+)", version_id)
+    if not match:
+        return None
+    return int(match.group(1))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -963,6 +1032,30 @@ def _oratab_file(path: pathlib.Path) -> FileSpec:
     return FileSpec(path=path, content=content, owner="root", group="root", mode=0o664)
 
 
+def _packages_for_plan(config: SetupConfig) -> List[str]:
+    packages = list(config.packages)
+    if not packages:
+        return packages
+
+    os_major = detect_oracle_linux_major_version()
+    if os_major is None or os_major < 8 or "compat-libcap1" not in packages:
+        return packages
+
+    filtered = [pkg for pkg in packages if pkg != "compat-libcap1"]
+    if config.database.is_legacy_release():
+        LOG.warning(
+            "compat-libcap1 is unavailable on Oracle Linux %s. Oracle Database %s deployments that require it must install the package manually.",
+            os_major,
+            config.database.target_version,
+        )
+    else:
+        LOG.debug(
+            "Skipping compat-libcap1 on Oracle Linux %s because it is not provided for modern releases.",
+            os_major,
+        )
+    return filtered
+
+
 def build_plan(
     resources: ResourceSummary,
     oracle_user: str,
@@ -996,7 +1089,7 @@ def build_plan(
         directories.extend(_fmw_directories(fmw_spec))
         files.extend(_fmw_files(fmw_spec, config.paths.profile_dir))
 
-    packages = list(config.packages)
+    packages = _packages_for_plan(config)
 
     return ConfigurationPlan(
         resources=resources,

@@ -21,6 +21,31 @@ def fake_resources(mem_gb: int, cpus: int = 4, hugepage_kb: int = 2048, swap_gb:
     )
 
 
+def basic_config(packages=None, target_version="19c"):
+    packages = packages or ["compat-libcap1", "pkg-other"]
+    return oracle_setup.SetupConfig.from_mapping(
+        {
+            "packages": {"install": packages},
+            "groups": [{"name": "dba"}],
+            "users": [
+                {
+                    "name": "oracle",
+                    "primary_group": "dba",
+                    "supplementary_groups": [],
+                    "home": "/oracle",
+                }
+            ],
+            "paths": {
+                "data_root": "/oradata",
+                "profile_dir": "/etc/profile.d",
+                "ora_inventory": "/etc/oraInst.loc",
+                "oratab": "/etc/oratab",
+            },
+            "database": {"target_version": target_version},
+        }
+    )
+
+
 @pytest.mark.parametrize(
     "mem_gb,swap_gb,expected",
     [
@@ -119,6 +144,26 @@ oratab = "/etc/custom_oratab"
     assert plan.packages == ["pkg-a"]
 
 
+def test_skip_compat_libcap1_on_ol8(monkeypatch):
+    config = basic_config()
+    monkeypatch.setattr(oracle_setup, "detect_oracle_linux_major_version", lambda: 8)
+
+    res = fake_resources(8)
+    plan = oracle_setup.build_plan(res, "oracle", fmw_user=None, config=config)
+
+    assert "compat-libcap1" not in plan.packages
+    assert "pkg-other" in plan.packages
+
+
+def test_warn_when_12c_requires_compat(monkeypatch, caplog):
+    config = basic_config(target_version="12c")
+    monkeypatch.setattr(oracle_setup, "detect_oracle_linux_major_version", lambda: 8)
+    caplog.set_level("WARNING")
+
+    res = fake_resources(8)
+    oracle_setup.build_plan(res, "oracle", fmw_user=None, config=config)
+
+    assert any("compat-libcap1 is unavailable" in record.message for record in caplog.records)
 def test_legacy_runner_invokes_shell(tmp_path):
     legacy_script = tmp_path / "oracle.sh"
     legacy_script.write_text("#!/bin/bash\necho legacy\n", encoding="utf-8")
