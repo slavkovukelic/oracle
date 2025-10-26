@@ -18,6 +18,8 @@ export INSTLOG=/tmp/install.log
 export ISO_DIR=/iso
 export INSTALL_DIR=/INSTALL
 export ISO_FILE=""
+INSPECT_RECOMMENDATION_COUNT=0
+declare -a INSPECT_RECOMMENDATIONS=()
 unalias cp
 #
 #
@@ -105,7 +107,9 @@ if [ "$UID" -ne 0 ]; then
     echo "This script requires root privileges to run properly."
   exit
 fi
-echo  > $INSTLOG       > /dev/null 2>&1
+if [ -z "$SKIP_INSTLOG_RESET" ]; then
+  echo  > $INSTLOG       > /dev/null 2>&1
+fi
 }
 #
 #
@@ -1707,6 +1711,140 @@ dnf remove -y --oldinstallonly --setopt installonly_limit=2 kernel
 # mv -f /etc/yum.repos.d/*.* /etc/yum.repos.d/LOCKED
 # ext4 defrag = https://www.baeldung.com/linux/ext4-filesystem-defragment
 }
+
+# ...................
+function f_inspect_environment()
+# ...................
+{
+echo "============================================================"
+echo " Oracle environment inspection (dry run)"
+echo "============================================================"
+echo "Host: $HOSTNAME"
+echo "Date: $(date)"
+echo "------------------------------------------------------------"
+
+local -a RECOMMENDATIONS=()
+
+local selinux_state="unknown"
+if command -v getenforce > /dev/null 2>&1; then
+  selinux_state=$(getenforce 2>/dev/null)
+elif [ -f /etc/selinux/config ]; then
+  selinux_state=$(grep -i '^SELINUX=' /etc/selinux/config | awk -F= '{print $2}')
+fi
+echo "SELinux status: $selinux_state"
+if [[ ! "$selinux_state" =~ [Dd]isabled ]]; then
+  RECOMMENDATIONS+=("Disable SELinux and set SELINUX=disabled in /etc/sysconfig/selinux.")
+fi
+
+local ipv6_disabled="no"
+if grep -q "^NETWORKING_IPV6=no" /etc/sysconfig/network 2>/dev/null; then
+  ipv6_disabled="yes"
+fi
+echo "IPv6 disabled in /etc/sysconfig/network: $ipv6_disabled"
+if [ "$ipv6_disabled" != "yes" ] || ! grep -q "disable=1" /etc/modprobe.d/disable-ipv6.conf 2>/dev/null; then
+  RECOMMENDATIONS+=("Disable IPv6 modules for Oracle workloads (network configuration and /etc/modprobe.d/disable-ipv6.conf).")
+fi
+
+local limits_conf="/etc/security/limits.conf"
+local limits_ok="yes"
+local limits_patterns=("* soft nofile 131072" "* hard nofile 131072" "* soft nproc 131072" "* hard nproc 131072")
+for pattern in "${limits_patterns[@]}"; do
+  local grep_pattern=$(echo "$pattern" | sed 's/\*/\\*/g' | sed 's/ /[[:space:]]\+/g')
+  if ! grep -Eq "^[[:space:]]*$grep_pattern" "$limits_conf" 2>/dev/null; then
+    limits_ok="no"
+    break
+  fi
+done
+echo "File descriptor and process limits tuned: $limits_ok"
+if [ "$limits_ok" != "yes" ]; then
+  RECOMMENDATIONS+=("Tune /etc/security/limits.conf with Oracle recommended nofile and nproc values.")
+fi
+
+local nproc_file="/etc/security/limits.d/90-nproc.conf"
+local nproc_ok="yes"
+if ! grep -q "16384" "$nproc_file" 2>/dev/null; then
+  nproc_ok="no"
+  RECOMMENDATIONS+=("Increase default nproc in /etc/security/limits.d/90-nproc.conf to 16384.")
+fi
+echo "90-nproc.conf tuned: $nproc_ok"
+
+local sysctl_keys=("fs.aio-max-nr" "fs.file-max" "kernel.shmmax" "net.core.somaxconn" "net.ipv4.ip_local_port_range")
+local sysctl_expected=("1048576" "6815744" "4398046511104" "3000" "1024 65500")
+echo "------------------------------------------------------------"
+echo "Sysctl comparison"
+for idx in "${!sysctl_keys[@]}"; do
+  local key="${sysctl_keys[$idx]}"
+  local expected="${sysctl_expected[$idx]}"
+  local current=$(sysctl -n "$key" 2>/dev/null || echo "missing")
+  printf "%-35s current: %-20s expected: %s\n" "$key" "$current" "$expected"
+  if [ "$current" != "$expected" ]; then
+    RECOMMENDATIONS+=("Set sysctl $key=$expected (current: $current).")
+  fi
+done
+
+local oracle_user_status="present"
+if ! id oracle > /dev/null 2>&1; then
+  oracle_user_status="missing"
+fi
+local fmw_user_status="present"
+if ! id fmw > /dev/null 2>&1; then
+  fmw_user_status="missing"
+fi
+echo "------------------------------------------------------------"
+echo "Oracle user: $oracle_user_status"
+echo "FMW user: $fmw_user_status"
+if [ "$oracle_user_status" = "missing" ] || [ "$fmw_user_status" = "missing" ]; then
+  RECOMMENDATIONS+=("Create oracle/fmw users, groups, and base directories.")
+fi
+
+echo "------------------------------------------------------------"
+INSPECT_RECOMMENDATION_COUNT=${#RECOMMENDATIONS[@]}
+INSPECT_RECOMMENDATIONS=()
+if [ $INSPECT_RECOMMENDATION_COUNT -eq 0 ]; then
+  echo "No tuning actions required. Environment already matches recommended settings."
+else
+  echo "Recommended tuning actions:"
+  local idx=1
+  for recommendation in "${RECOMMENDATIONS[@]}"; do
+    printf " %d) %s\n" "$idx" "$recommendation"
+    INSPECT_RECOMMENDATIONS+=("$recommendation")
+    ((idx++))
+  done
+fi
+echo "============================================================"
+}
+
+# ...................
+function f_run_full_install()
+# ...................
+{
+f_is_root;
+echo "... Checking mandatory requirements"                 | tee -a $INSTLOG;
+f_ol_release;
+f_arch;
+f_start_again;
+echo "... Optimizing configuration"                       | tee -a $INSTLOG;
+f_ip_check;
+f_modify_lx_files;
+f_sysctl_conf;
+f_create_o_users;
+f_root_utils;
+f_init_wbl;
+f_init_odb;
+f_utils_oracle;
+f_utils_fmw;
+echo "... Mounting OL install media"                       | tee -a $INSTLOG;
+f_init_iso;
+echo "... Install packages from local media"               | tee -a $INSTLOG;
+f_ora_packs                                                   | tee -a $INSTLOG;
+unw_services                                                  | tee -a $INSTLOG;
+set_yum_repos                                                 | tee -a $INSTLOG;
+f_vnc                                                         | tee -a $INSTLOG;
+f_grubby                                                      | tee -a $INSTLOG;
+f_intro;
+f_memo;
+}
+
 # ...................
 
 # ...................
@@ -1732,41 +1870,42 @@ echo "-----------------------------------------------------------"
 echo " Please press y to continue or n to abort    "
 echo "-----------------------------------------------------------"
 echo " "
+if [ "$1" = "inspect" ]; then
+  SKIP_INSTLOG_RESET=1
+  f_is_root
+  unset SKIP_INSTLOG_RESET
+  f_inspect_environment
+  if [ $INSPECT_RECOMMENDATION_COUNT -eq 0 ]; then
+    exit 0
+  fi
+  echo ""
+  echo "Apply the recommended tuning actions now?"
+  while true; do
+    read -p "APPLY y/n: " apply_answer
+    case $apply_answer in
+      [Yy]* )
+        f_run_full_install
+        exit 0;;
+      [Nn]* )
+        echo "No changes were applied."
+        exit 0;;
+      * ) echo "Please answer yes or no.";;
+    esac
+  done
+fi
+
 while true; do
     read -p "CONTINUE y/n: " yn
     case $yn in
-        [Yy]* ) 
-          #
-          f_is_root;
-             echo "... Checking mandatory requirements"                 | tee -a $INSTLOG;
-          f_ol_release;
-          f_arch;        
-          f_start_again;
-              echo "... Optimizing configuration"                       | tee -a $INSTLOG;
-          f_ip_check;
-          f_modify_lx_files;
-          f_sysctl_conf;
-          f_create_o_users;
-          f_root_utils;
-          f_init_wbl;
-          f_init_odb;
-          f_utils_oracle;
-          f_utils_fmw;
-             echo "... Mounting OL install media"                       | tee -a $INSTLOG;
-          f_init_iso;          
-             echo "... Install packages from local media"               | tee -a $INSTLOG; 
-          f_ora_packs                                                   | tee -a $INSTLOG;
-          unw_services                                                  | tee -a $INSTLOG;
-          set_yum_repos                                                 | tee -a $INSTLOG;
-		  f_vnc                                                         | tee -a $INSTLOG;
-		  f_grubby                                                      | tee -a $INSTLOG;
-          f_intro;  
-          f_memo;
-             break;;
+        [Yy]* )
+          f_run_full_install;
+          break;;
         [Nn]* ) exit;;
         * ) echo "Please answer yes or no.";;
     esac
-done
+ done
 
-]0;root@ppodb:~[32mroot@ppodb [33m~[0m
+]0;root@ppodb:~[32mroot@ppodb [33m~[0m
+
+# 
 # 
