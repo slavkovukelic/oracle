@@ -99,3 +99,43 @@ def test_package_installation_invoked(monkeypatch):
 
     assert run_calls
     assert run_calls[0][:3] == ["/usr/bin/dnf", "-y", "install"]
+
+
+def test_parse_args_supports_inspection():
+    args = oracle_setup.parse_args(["--inspect"])
+    assert args.inspect is True
+
+
+def test_inspection_reports_differences():
+    res = fake_resources(8)
+    plan = oracle_setup.build_plan(res, "oracle", fmw_user=None)
+    kernel = plan.kernel.as_sysctl_dict()
+
+    def fake_reader(key: str):
+        if key == "kernel.shmmax":
+            return kernel[key]
+        if key == "kernel.shmall":
+            return str(int(kernel[key]) // 2)
+        return None
+
+    report = oracle_setup.inspect_current_system(plan, sysctl_reader=fake_reader)
+
+    assert report["sysctl"]["kernel.shmmax"]["status"] == "ok"
+    assert report["sysctl"]["kernel.shmall"]["status"] == "needs_update"
+    assert "kernel.shmall" in report["recommendations"]
+
+
+def test_inspection_reports_missing_packages():
+    res = fake_resources(8)
+    plan = oracle_setup.build_plan(res, "oracle", fmw_user=None)
+    plan.packages = ["pkg-one", "pkg-two"]
+
+    def fake_checker(packages):
+        return {"pkg-one": True, "pkg-two": False}
+
+    report = oracle_setup.inspect_current_system(plan, package_checker=fake_checker)
+
+    assert report["packages"]["status"] == "missing"
+    assert report["packages"]["missing"] == ["pkg-two"]
+    assert report["packages"]["details"]["pkg-one"] == "installed"
+    assert any(item == "package:pkg-two" for item in report["recommendations"])
