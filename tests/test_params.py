@@ -64,6 +64,42 @@ def test_plan_includes_directories_and_files():
     assert any(user.name == "fmw" for user in plan.users)
 
 
+def test_custom_config_overrides_paths(tmp_path):
+    config_path = tmp_path / "custom.toml"
+    config_path.write_text(
+        """
+[packages]
+install = ["pkg-a"]
+
+[[groups]]
+name = "dbgrp"
+
+[[users]]
+name = "oracle"
+primary_group = "dbgrp"
+home = "/opt/oracle"
+
+[paths]
+data_root = "/mnt/oradata"
+profile_dir = "/opt/profiles"
+ora_inventory = "/etc/custom_oraInst.loc"
+oratab = "/etc/custom_oratab"
+""",
+        encoding="utf-8",
+    )
+
+    config = oracle_setup.load_setup_config(config_path)
+    res = fake_resources(16)
+    plan = oracle_setup.build_plan(res, "oracle", fmw_user=None, config=config)
+
+    directory_paths = {spec.path for spec in plan.directories}
+    file_paths = {spec.path for spec in plan.files}
+
+    assert pathlib.Path("/mnt/oradata") in directory_paths
+    assert pathlib.Path("/etc/custom_oraInst.loc") in file_paths
+    assert plan.packages == ["pkg-a"]
+
+
 def test_legacy_runner_invokes_shell(tmp_path):
     legacy_script = tmp_path / "oracle.sh"
     legacy_script.write_text("#!/bin/bash\necho legacy\n", encoding="utf-8")

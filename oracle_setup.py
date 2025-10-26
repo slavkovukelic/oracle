@@ -32,7 +32,12 @@ import pwd
 import shutil
 import subprocess
 import sys
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Tuple
+
+try:  # Python 3.11+
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - fallback for older runtimes
+    import tomli as tomllib  # type: ignore[assignment]
 
 LOG = logging.getLogger(__name__)
 
@@ -404,22 +409,134 @@ def run_command(cmd: List[str], check: bool = True) -> subprocess.CompletedProce
     return result
 
 
-RECOMMENDED_PACKAGES = {
-    "bc",
-    "binutils",
-    "compat-libcap1",
-    "elfutils-libelf-devel",
-    "gcc",
-    "glibc",
-    "ksh",
-    "libaio",
-    "libstdc++",
-    "make",
-    "net-tools",
-    "nfs-utils",
-    "smartmontools",
-    "sysstat",
-}
+
+@dataclasses.dataclass(frozen=True)
+class PathSettings:
+    """Paths to key directories and files used by the provisioner."""
+
+    data_root: pathlib.Path
+    profile_dir: pathlib.Path
+    ora_inventory: pathlib.Path
+    oratab: pathlib.Path
+
+
+@dataclasses.dataclass(frozen=True)
+class SetupConfig:
+    """Configuration loaded from a TOML manifest."""
+
+    packages: Tuple[str, ...]
+    groups: Tuple[GroupSpec, ...]
+    users: Dict[str, UserSpec]
+    paths: PathSettings
+
+    def get_user(self, name: str) -> UserSpec:
+        try:
+            return self.users[name]
+        except KeyError as exc:  # pragma: no cover - defensive guard
+            raise KeyError(f"User '{name}' is not defined in the configuration") from exc
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, object]) -> "SetupConfig":
+        packages_section = data.get("packages", {})
+        if not isinstance(packages_section, Mapping):
+            raise TypeError("[packages] section must be a table in the configuration")
+        package_list = packages_section.get("install", [])
+        if isinstance(package_list, (str, bytes)):
+            raise TypeError("packages.install must be a list of package names")
+        if not isinstance(package_list, Iterable):
+            raise TypeError("packages.install must be a list of package names")
+        packages = tuple(sorted({str(item) for item in package_list}))
+
+        groups_section = data.get("groups", [])
+        if not isinstance(groups_section, Iterable):
+            raise TypeError("[[groups]] section must be a list of tables")
+        groups: List[GroupSpec] = []
+        for entry in groups_section:
+            if not isinstance(entry, Mapping):
+                raise TypeError("Each group entry must be a table")
+            name = entry.get("name")
+            if not isinstance(name, str):
+                raise TypeError("Group name must be a string")
+            gid = entry.get("gid")
+            if gid is not None and not isinstance(gid, int):
+                raise TypeError("Group gid must be an integer if provided")
+            groups.append(GroupSpec(name=name, gid=gid))
+
+        users_section = data.get("users", [])
+        if not isinstance(users_section, Iterable):
+            raise TypeError("[[users]] section must be a list of tables")
+        users: Dict[str, UserSpec] = {}
+        for entry in users_section:
+            if not isinstance(entry, Mapping):
+                raise TypeError("Each user entry must be a table")
+            name = entry.get("name")
+            if not isinstance(name, str):
+                raise TypeError("User name must be a string")
+            primary_group = entry.get("primary_group")
+            if not isinstance(primary_group, str):
+                raise TypeError(f"User {name!r} requires a primary_group string")
+            supplementary = entry.get("supplementary_groups", [])
+            if supplementary is None:
+                supplementary_groups: Tuple[str, ...] = tuple()
+            elif isinstance(supplementary, Iterable) and not isinstance(supplementary, (str, bytes)):
+                supplementary_groups = tuple(str(item) for item in supplementary)
+            else:
+                raise TypeError(f"User {name!r} supplementary_groups must be a list of strings")
+            home_raw = entry.get("home")
+            if not isinstance(home_raw, str):
+                raise TypeError(f"User {name!r} requires a home path string")
+            shell = entry.get("shell", "/bin/bash")
+            if not isinstance(shell, str):
+                raise TypeError(f"User {name!r} shell must be a string")
+            uid = entry.get("uid")
+            if uid is not None and not isinstance(uid, int):
+                raise TypeError(f"User {name!r} uid must be an integer")
+            create_home = bool(entry.get("create_home", False))
+            spec = UserSpec(
+                name=name,
+                primary_group=primary_group,
+                supplementary_groups=supplementary_groups,
+                home=pathlib.Path(home_raw),
+                shell=shell,
+                uid=uid,
+                create_home=create_home,
+            )
+            users[name] = spec
+
+        paths_section = data.get("paths")
+        if not isinstance(paths_section, Mapping):
+            raise TypeError("[paths] section must be defined in the configuration")
+
+        def _as_path(value: object, key: str) -> pathlib.Path:
+            if not isinstance(value, str):
+                raise TypeError(f"paths.{key} must be a string")
+            return pathlib.Path(value)
+
+        try:
+            paths = PathSettings(
+                data_root=_as_path(paths_section["data_root"], "data_root"),
+                profile_dir=_as_path(paths_section["profile_dir"], "profile_dir"),
+                ora_inventory=_as_path(paths_section["ora_inventory"], "ora_inventory"),
+                oratab=_as_path(paths_section["oratab"], "oratab"),
+            )
+        except KeyError as exc:
+            raise KeyError(f"Missing required path setting: {exc.args[0]}") from exc
+
+        return cls(packages=packages, groups=tuple(groups), users=users, paths=paths)
+
+
+DEFAULT_CONFIG_PATH = pathlib.Path(__file__).with_name("oracle_setup.toml")
+
+
+def load_setup_config(path: Optional[pathlib.Path] = None) -> SetupConfig:
+    """Load a :class:`SetupConfig` from the provided TOML file."""
+
+    config_path = path or DEFAULT_CONFIG_PATH
+    with config_path.open("rb") as fh:
+        data = tomllib.load(fh)
+    if not isinstance(data, Mapping):
+        raise TypeError("Configuration root must be a table")
+    return SetupConfig.from_mapping(data)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -748,6 +865,7 @@ def _oracle_directories(user: UserSpec) -> List[DirectorySpec]:
 
 def _fmw_directories(user: UserSpec) -> List[DirectorySpec]:
     base = user.home
+    inventory_group = "oinstall" if "oinstall" in user.supplementary_groups else user.primary_group
     return [
         DirectorySpec(base, owner=user.name, group=user.primary_group, mode=0o750),
         DirectorySpec(base / "INSTALL", owner=user.name, group=user.primary_group),
@@ -756,12 +874,12 @@ def _fmw_directories(user: UserSpec) -> List[DirectorySpec]:
         DirectorySpec(base / "utils", owner=user.name, group=user.primary_group),
         DirectorySpec(base / "mwhome", owner=user.name, group=user.primary_group, mode=0o750),
         DirectorySpec(base / "tmp", owner=user.name, group=user.primary_group, mode=0o770),
-        DirectorySpec(base / "oraInventory", owner=user.name, group="oinstall", mode=0o770),
+        DirectorySpec(base / "oraInventory", owner=user.name, group=inventory_group, mode=0o770),
     ]
 
 
-def _oracle_files(user: UserSpec, data_dir: pathlib.Path) -> List[FileSpec]:
-    profile_path = pathlib.Path("/etc/profile.d") / f"{user.name}_oracle.sh"
+def _oracle_files(user: UserSpec, data_dir: pathlib.Path, profile_dir: pathlib.Path) -> List[FileSpec]:
+    profile_path = profile_dir / f"{user.name}_oracle.sh"
     bash_profile_path = user.home / ".bash_profile"
     files = [
         FileSpec(
@@ -782,8 +900,8 @@ def _oracle_files(user: UserSpec, data_dir: pathlib.Path) -> List[FileSpec]:
     return files
 
 
-def _fmw_files(user: UserSpec) -> List[FileSpec]:
-    profile_path = pathlib.Path("/etc/profile.d") / f"{user.name}_fmw.sh"
+def _fmw_files(user: UserSpec, profile_dir: pathlib.Path) -> List[FileSpec]:
+    profile_path = profile_dir / f"{user.name}_fmw.sh"
     bash_profile_path = user.home / ".bash_profile"
     files = [
         FileSpec(
@@ -804,58 +922,57 @@ def _fmw_files(user: UserSpec) -> List[FileSpec]:
     return files
 
 
-def _ora_inventory_file(user: UserSpec) -> FileSpec:
+def _ora_inventory_file(user: UserSpec, path: pathlib.Path) -> FileSpec:
     content = (
         f"inventory_loc={user.home / 'oraInventory'}\n"
         f"inst_group={user.primary_group}\n"
     )
-    return FileSpec(path=pathlib.Path("/etc/oraInst.loc"), content=content, owner="root", group="oinstall", mode=0o664)
+    inventory_group = "oinstall" if "oinstall" in user.supplementary_groups else user.primary_group
+    return FileSpec(path=path, content=content, owner="root", group=inventory_group, mode=0o664)
 
 
-def _oratab_file() -> FileSpec:
+def _oratab_file(path: pathlib.Path) -> FileSpec:
     content = (
         "# /etc/oratab generated by oracle_setup.py\n"
         "# Populate this file after creating Oracle databases.\n"
     )
-    return FileSpec(path=pathlib.Path("/etc/oratab"), content=content, owner="root", group="root", mode=0o664)
+    return FileSpec(path=path, content=content, owner="root", group="root", mode=0o664)
 
 
-def build_plan(resources: ResourceSummary, oracle_user: str, fmw_user: Optional[str] = "fmw") -> ConfigurationPlan:
+def build_plan(
+    resources: ResourceSummary,
+    oracle_user: str,
+    fmw_user: Optional[str] = "fmw",
+    *,
+    config: Optional[SetupConfig] = None,
+) -> ConfigurationPlan:
     kernel = OracleKernelParameters.from_resources(resources)
     limits = OracleLimits.from_resources(resources)
 
-    groups = [GroupSpec("oinstall"), GroupSpec("dba")]
-    users: List[UserSpec] = [
-        UserSpec(
-            name=oracle_user,
-            primary_group="dba",
-            supplementary_groups=("oinstall",),
-            home=pathlib.Path(f"/{oracle_user}"),
-        )
-    ]
+    config = config or load_setup_config()
 
+    groups = list(config.groups)
+    users: List[UserSpec] = []
     directories: List[DirectorySpec] = []
     files: List[FileSpec] = []
 
-    data_dir = pathlib.Path("/oradata")
-    directories.extend(_oracle_directories(users[0]))
-    directories.append(DirectorySpec(data_dir, owner=oracle_user, group="dba", mode=0o770))
-    files.extend(_oracle_files(users[0], data_dir))
-    files.append(_ora_inventory_file(users[0]))
-    files.append(_oratab_file())
+    oracle_spec = config.get_user(oracle_user)
+    users.append(oracle_spec)
+
+    data_dir = config.paths.data_root
+    directories.extend(_oracle_directories(oracle_spec))
+    directories.append(DirectorySpec(data_dir, owner=oracle_spec.name, group=oracle_spec.primary_group, mode=0o770))
+    files.extend(_oracle_files(oracle_spec, data_dir, config.paths.profile_dir))
+    files.append(_ora_inventory_file(oracle_spec, config.paths.ora_inventory))
+    files.append(_oratab_file(config.paths.oratab))
 
     if fmw_user:
-        fmw_spec = UserSpec(
-            name=fmw_user,
-            primary_group="dba",
-            supplementary_groups=("oinstall",),
-            home=pathlib.Path(f"/{fmw_user}"),
-        )
+        fmw_spec = config.get_user(fmw_user)
         users.append(fmw_spec)
         directories.extend(_fmw_directories(fmw_spec))
-        files.extend(_fmw_files(fmw_spec))
+        files.extend(_fmw_files(fmw_spec, config.paths.profile_dir))
 
-    packages = sorted(RECOMMENDED_PACKAGES)
+    packages = list(config.packages)
 
     return ConfigurationPlan(
         resources=resources,
@@ -1044,6 +1161,11 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         type=pathlib.Path,
         help="Override path to oracle.sh when using legacy mode.",
     )
+    parser.add_argument(
+        "--config",
+        type=pathlib.Path,
+        help="Path to a TOML configuration file describing packages, users, and directories.",
+    )
     return parser.parse_args(argv)
 
 
@@ -1067,10 +1189,12 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             LOG.info("Legacy dry-run completed. No changes were made.")
         return 0
 
+    config = load_setup_config(args.config)
+
     inspector = SystemInspector()
     resources = inspector.collect()
     fmw_user = None if args.no_fmw else (args.fmw_user or None)
-    plan = build_plan(resources, args.oracle_user, fmw_user)
+    plan = build_plan(resources, args.oracle_user, fmw_user, config=config)
 
     plan_summary = plan.describe()
     LOG.info("Calculated configuration summary:\n%s", plan_summary)
