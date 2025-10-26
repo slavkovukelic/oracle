@@ -22,14 +22,13 @@ import argparse
 import base64
 import dataclasses
 import importlib.util
-import json
 import logging
+import posixpath
 import pathlib
+import shlex
 import threading
 import tkinter as tk
-from tkinter import messagebox, ttk
-import urllib.error
-import urllib.request
+from tkinter import filedialog, messagebox, ttk
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 LOG = logging.getLogger(__name__)
@@ -194,42 +193,133 @@ class ExecutionResult:
     raw: Mapping[str, Any]
 
 
-class RemoteExecutor:
-    """HTTP client that posts bundles to a remote execution service."""
+@dataclasses.dataclass(frozen=True)
+class SSHConnectionInfo:
+    """Connection parameters required to reach the remote host over SSH."""
 
-    def __init__(self, endpoint: str, timeout: int = 30) -> None:
-        self.endpoint = endpoint
-        self.timeout = timeout
+    host: str
+    username: str
+    port: int = 22
+    password: Optional[str] = None
+    key_path: Optional[pathlib.Path] = None
+    remote_directory: str = "."
+
+
+class SSHExecutor:
+    """Upload the bundle over SSH and execute it on the remote host."""
+
+    def __init__(self, connection: SSHConnectionInfo, connect_timeout: int = 30, command_timeout: int = 600) -> None:
+        self.connection = connection
+        self.connect_timeout = connect_timeout
+        self.command_timeout = command_timeout
 
     def execute(self, bundle: ExecutionBundle) -> ExecutionResult:
-        data = json.dumps(bundle.to_payload()).encode("utf-8")
-        request = urllib.request.Request(
-            self.endpoint,
-            data=data,
-            headers={"Content-Type": "application/json"},
-        )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                response_data = response.read()
-                content_type = response.headers.get("Content-Type", "application/json")
-        except urllib.error.URLError as exc:  # pragma: no cover - network errors
-            raise RuntimeError(f"Failed to contact execution server: {exc}") from exc
+            import paramiko
+        except ImportError as exc:  # pragma: no cover - import guard for optional dependency
+            raise RuntimeError(
+                "Paramiko is required for SSH execution. Install it with 'pip install paramiko'."
+            ) from exc
 
-        charset = "utf-8"
-        if "charset=" in content_type:
-            charset = content_type.split("charset=", 1)[1].split(";", 1)[0].strip()
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+        connect_kwargs: Dict[str, Any] = {
+            "hostname": self.connection.host,
+            "port": self.connection.port,
+            "username": self.connection.username,
+            "timeout": self.connect_timeout,
+            "banner_timeout": self.connect_timeout,
+            "auth_timeout": self.connect_timeout,
+            "allow_agent": True,
+            "look_for_keys": True,
+        }
+        if self.connection.password:
+            connect_kwargs["password"] = self.connection.password
+        if self.connection.key_path:
+            connect_kwargs["key_filename"] = str(self.connection.key_path)
+
         try:
-            payload = json.loads(response_data.decode(charset or "utf-8"))
-        except json.JSONDecodeError as exc:
-            raise RuntimeError("Execution server returned invalid JSON") from exc
+            client.connect(**connect_kwargs)
+        except Exception as exc:  # pragma: no cover - depends on network environment
+            raise RuntimeError(f"Failed to establish SSH connection: {exc}") from exc
 
+        stdout_bytes = b""
+        stderr_bytes = b""
+        returncode: Optional[int] = None
+        try:
+            sftp = client.open_sftp()
+            remote_dir = (self.connection.remote_directory or ".").replace("\\", "/")
+            if remote_dir not in ("", "."):
+                self._ensure_remote_directory(sftp, remote_dir)
+            remote_script = posixpath.join(remote_dir, bundle.script_path.name) if remote_dir not in ("", ".") else bundle.script_path.name
+            remote_config = posixpath.join(remote_dir, bundle.config_path.name) if remote_dir not in ("", ".") else bundle.config_path.name
+
+            self._upload_file(sftp, remote_script, bundle.script_content)
+            self._upload_file(sftp, remote_config, bundle.config_content)
+
+            if bundle.script_path.suffix == ".sh":
+                sftp.chmod(remote_script, 0o755)
+
+            sftp.close()
+
+            command = self._build_command(bundle, remote_dir)
+            stdin, stdout, stderr = client.exec_command(command, timeout=self.command_timeout)
+            stdout_bytes = stdout.read()
+            stderr_bytes = stderr.read()
+            returncode = stdout.channel.recv_exit_status()
+        except Exception as exc:
+            raise RuntimeError(f"Remote execution failed: {exc}") from exc
+        finally:
+            client.close()
+
+        stdout_text = stdout_bytes.decode("utf-8", errors="replace")
+        stderr_text = stderr_bytes.decode("utf-8", errors="replace")
+        status = "completed" if returncode == 0 else "failed"
+        payload = {
+            "status": status,
+            "stdout": stdout_text,
+            "stderr": stderr_text,
+            "returncode": returncode,
+            "remote_directory": self.connection.remote_directory,
+            "host": self.connection.host,
+        }
         return ExecutionResult(
-            status=str(payload.get("status", "unknown")),
-            stdout=str(payload.get("stdout", "")),
-            stderr=str(payload.get("stderr", "")),
-            returncode=payload.get("returncode"),
+            status=status,
+            stdout=stdout_text,
+            stderr=stderr_text,
+            returncode=returncode,
             raw=payload,
         )
+
+    def _ensure_remote_directory(self, sftp: Any, remote_dir: str) -> None:
+        parts = [part for part in remote_dir.split("/") if part and part != "."]
+        current = ""
+        for part in parts:
+            current = f"{current}/{part}" if current else part
+            try:
+                sftp.stat(current)
+            except (FileNotFoundError, OSError):
+                sftp.mkdir(current)
+
+    def _upload_file(self, sftp: Any, remote_path: str, content: bytes) -> None:
+        with sftp.file(remote_path, "wb") as remote_file:
+            remote_file.write(content)
+
+    def _build_command(self, bundle: ExecutionBundle, remote_dir: str) -> str:
+        script_name = bundle.script_path.name
+        command_parts: List[str] = []
+        if remote_dir not in ("", "."):
+            command_parts.extend(["cd", shlex.quote(remote_dir), "&&"])
+
+        if bundle.script_path.suffix == ".sh":
+            command_parts.append("bash")
+        else:
+            command_parts.append("python3")
+        command_parts.append(shlex.quote(script_name))
+        for arg in bundle.arguments:
+            command_parts.append(shlex.quote(arg))
+        return " ".join(command_parts)
 
 
 def _load_python_parser(script_path: pathlib.Path) -> Optional[argparse.ArgumentParser]:
@@ -257,7 +347,10 @@ class OracleSetupClient(tk.Tk):
         self,
         script_directory: Optional[pathlib.Path] = None,
         config_path: Optional[pathlib.Path] = None,
-        endpoint: str = "http://localhost:8000/execute",
+        ssh_host: str = "localhost",
+        ssh_port: int = 22,
+        ssh_username: str = "",
+        ssh_remote_directory: str = ".",
     ) -> None:
         super().__init__()
         self.title("Oracle Remote Execution Client")
@@ -266,14 +359,18 @@ class OracleSetupClient(tk.Tk):
 
         self.script_directory = script_directory or pathlib.Path(__file__).resolve().parent
         self.config_path = config_path or self.script_directory / "oracle_setup.toml"
-        self.endpoint = endpoint
 
         self.scripts = discover_scripts(self.script_directory)
         self.argument_specs: List[ArgumentSpec] = []
         self.argument_vars: Dict[str, tk.Variable] = {}
 
         self.script_var = tk.StringVar(value=next(iter(self.scripts), ""))
-        self.server_url_var = tk.StringVar(value=self.endpoint)
+        self.ssh_host_var = tk.StringVar(value=ssh_host)
+        self.ssh_port_var = tk.StringVar(value=str(ssh_port))
+        self.ssh_username_var = tk.StringVar(value=ssh_username)
+        self.ssh_password_var = tk.StringVar(value="")
+        self.ssh_key_var = tk.StringVar(value="")
+        self.ssh_remote_dir_var = tk.StringVar(value=ssh_remote_directory)
 
         self._build_ui()
         self._load_config()
@@ -298,12 +395,35 @@ class OracleSetupClient(tk.Tk):
         self.script_combo.pack(side="left", padx=5, fill="x", expand=True)
         self.script_combo.bind("<<ComboboxSelected>>", lambda event: self._on_script_selected())
 
-        ttk.Label(header, text="Server endpoint:").pack(side="left", padx=(10, 0))
-        server_entry = ttk.Entry(header, textvariable=self.server_url_var, width=40)
-        server_entry.pack(side="left", padx=5)
-
         self.run_button = ttk.Button(header, text="Run Remotely", command=self._run_script)
         self.run_button.pack(side="left", padx=(10, 0))
+
+        connection_frame = ttk.LabelFrame(main, text="SSH Connection")
+        connection_frame.pack(fill="x", expand=False, pady=(0, 10))
+
+        connection_grid = ttk.Frame(connection_frame)
+        connection_grid.pack(fill="x", expand=True, padx=8, pady=8)
+        for column in range(4):
+            connection_grid.columnconfigure(column, weight=1)
+
+        ttk.Label(connection_grid, text="Host:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(connection_grid, textvariable=self.ssh_host_var).grid(row=0, column=1, sticky="we", padx=5)
+
+        ttk.Label(connection_grid, text="Port:").grid(row=0, column=2, sticky="w")
+        ttk.Entry(connection_grid, textvariable=self.ssh_port_var, width=6).grid(row=0, column=3, sticky="we", padx=5)
+
+        ttk.Label(connection_grid, text="Username:").grid(row=1, column=0, sticky="w", pady=(5, 0))
+        ttk.Entry(connection_grid, textvariable=self.ssh_username_var).grid(row=1, column=1, sticky="we", padx=5, pady=(5, 0))
+
+        ttk.Label(connection_grid, text="Password:").grid(row=1, column=2, sticky="w", pady=(5, 0))
+        ttk.Entry(connection_grid, textvariable=self.ssh_password_var, show="*").grid(row=1, column=3, sticky="we", padx=5, pady=(5, 0))
+
+        ttk.Label(connection_grid, text="Private key:").grid(row=2, column=0, sticky="w", pady=(5, 0))
+        ttk.Entry(connection_grid, textvariable=self.ssh_key_var).grid(row=2, column=1, sticky="we", padx=5, pady=(5, 0))
+        ttk.Button(connection_grid, text="Browse", command=self._browse_key_file).grid(row=2, column=2, sticky="we", padx=5, pady=(5, 0))
+
+        ttk.Label(connection_grid, text="Remote directory:").grid(row=3, column=0, sticky="w", pady=(5, 0))
+        ttk.Entry(connection_grid, textvariable=self.ssh_remote_dir_var).grid(row=3, column=1, columnspan=3, sticky="we", padx=5, pady=(5, 0))
 
         arguments_frame = ttk.LabelFrame(main, text="Script Parameters")
         arguments_frame.pack(fill="x", expand=False, pady=(0, 10))
@@ -437,6 +557,10 @@ class OracleSetupClient(tk.Tk):
             messagebox.showerror("No script", "Select a script before running.")
             return
 
+        connection = self._build_connection_info()
+        if connection is None:
+            return
+
         config_text = self.config_text.get("1.0", "end-1c")
         try:
             self.config_path.write_text(config_text, encoding="utf-8")
@@ -447,7 +571,7 @@ class OracleSetupClient(tk.Tk):
         argument_values = self._collect_argument_values()
         cli_args = build_cli_arguments(self.argument_specs, argument_values)
         bundle = ExecutionBundle.from_paths(script_path, self.config_path, config_text, cli_args)
-        executor = RemoteExecutor(self.server_url_var.get() or self.endpoint)
+        executor = SSHExecutor(connection)
 
         self.run_button.configure(state="disabled")
         self._append_log("Dispatching execution request...")
@@ -455,7 +579,7 @@ class OracleSetupClient(tk.Tk):
         thread = threading.Thread(target=self._run_in_background, args=(executor, bundle), daemon=True)
         thread.start()
 
-    def _run_in_background(self, executor: RemoteExecutor, bundle: ExecutionBundle) -> None:
+    def _run_in_background(self, executor: SSHExecutor, bundle: ExecutionBundle) -> None:
         try:
             result = executor.execute(bundle)
         except Exception as exc:  # pragma: no cover - relies on network exceptions
@@ -491,6 +615,47 @@ class OracleSetupClient(tk.Tk):
             append()
         else:
             self.after(0, append)
+
+    # ----------------------------------------------------------- SSH UTILS ---
+    def _browse_key_file(self) -> None:
+        filename = filedialog.askopenfilename(title="Select private key", filetypes=[("All files", "*.*")])
+        if filename:
+            self.ssh_key_var.set(filename)
+
+    def _build_connection_info(self) -> Optional[SSHConnectionInfo]:
+        host = self.ssh_host_var.get().strip()
+        if not host:
+            messagebox.showerror("Missing host", "Provide the SSH host name or IP address.")
+            return None
+
+        username = self.ssh_username_var.get().strip()
+        if not username:
+            messagebox.showerror("Missing username", "Provide the SSH username to authenticate with.")
+            return None
+
+        port_raw = self.ssh_port_var.get().strip() or "22"
+        try:
+            port = int(port_raw)
+        except ValueError:
+            messagebox.showerror("Invalid port", "SSH port must be a number.")
+            return None
+        if not (0 < port < 65536):
+            messagebox.showerror("Invalid port", "SSH port must be between 1 and 65535.")
+            return None
+
+        password = self.ssh_password_var.get() or None
+        key_value = self.ssh_key_var.get().strip()
+        key_path = pathlib.Path(key_value).expanduser() if key_value else None
+        remote_dir = self.ssh_remote_dir_var.get().strip() or "."
+
+        return SSHConnectionInfo(
+            host=host,
+            username=username,
+            port=port,
+            password=password,
+            key_path=key_path,
+            remote_directory=remote_dir,
+        )
 
 
 def main() -> None:

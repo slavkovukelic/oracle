@@ -1,12 +1,11 @@
 import base64
-import http.server
-import json
+import io
 import pathlib
-import socketserver
-import threading
-from typing import Any, Dict
-
 import sys
+import types
+from typing import Any, Dict, Optional
+
+import pytest
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -16,7 +15,8 @@ import oracle_setup
 
 from oracle_gui_client import (
     ExecutionBundle,
-    RemoteExecutor,
+    SSHConnectionInfo,
+    SSHExecutor,
     build_argument_specs,
     build_cli_arguments,
     discover_scripts,
@@ -68,49 +68,96 @@ def test_execution_bundle_payload(tmp_path):
     assert base64.b64decode(payload["config"]).decode("utf-8") == config_text
 
 
-class _RecorderHandler(http.server.BaseHTTPRequestHandler):
-    received: Dict[str, Any] = {}
-
-    def do_POST(self) -> None:  # pragma: no cover - exercised via integration test
-        length = int(self.headers.get("Content-Length", "0"))
-        data = json.loads(self.rfile.read(length).decode("utf-8"))
-        _RecorderHandler.received = data
-        body = json.dumps({"status": "ok", "stdout": "done", "stderr": "", "returncode": 0}).encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, format: str, *args: Any) -> None:  # pragma: no cover - silence test output
-        return
-
-
-def test_remote_executor_round_trip(tmp_path):
+def test_ssh_executor_round_trip(monkeypatch, tmp_path):
     script_path = tmp_path / "example.py"
     script_path.write_text("print('test')\n", encoding="utf-8")
     config_path = tmp_path / "config.toml"
     config_text = "name = 'value'\n"
     bundle = ExecutionBundle.from_paths(script_path, config_path, config_text, ["--mode", "legacy"])
 
-    class _Server(socketserver.TCPServer):
-        allow_reuse_address = True
+    uploaded: Dict[str, bytes] = {}
+    commands = []
 
-    server = _Server(("127.0.0.1", 0), _RecorderHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        endpoint = f"http://127.0.0.1:{server.server_address[1]}"
-        executor = RemoteExecutor(endpoint)
-        result = executor.execute(bundle)
-    finally:
-        server.shutdown()
-        thread.join()
-        server.server_close()
+    class DummySFTP:
+        def __init__(self) -> None:
+            self.closed = False
 
-    assert result.status == "ok"
-    assert result.stdout == "done"
-    assert _RecorderHandler.received["arguments"] == ["--mode", "legacy"]
+        def file(self, path: str, mode: str):
+            class _Writer(io.BytesIO):
+                def __init__(self) -> None:
+                    super().__init__()
+
+                def close(self_nonlocal) -> None:
+                    uploaded[path] = self_nonlocal.getvalue()
+                    super().close()
+
+            writer = _Writer()
+            return writer
+
+        def chmod(self, path: str, mode: int) -> None:
+            return None
+
+        def mkdir(self, path: str) -> None:
+            pass
+
+        def stat(self, path: str):
+            raise FileNotFoundError
+
+        def close(self) -> None:
+            self.closed = True
+
+    class DummyChannel:
+        def __init__(self, code: int) -> None:
+            self._code = code
+
+        def recv_exit_status(self) -> int:
+            return self._code
+
+    class DummyStream(io.BytesIO):
+        def __init__(self, data: bytes, code: int) -> None:
+            super().__init__(data)
+            self.channel = DummyChannel(code)
+
+    class DummySSHClient:
+        def __init__(self) -> None:
+            self.connected_with: Dict[str, Any] = {}
+            self.closed = False
+
+        def set_missing_host_key_policy(self, policy: Any) -> None:
+            self.policy = policy
+
+        def connect(self, **kwargs: Any) -> None:
+            self.connected_with = kwargs
+
+        def open_sftp(self) -> DummySFTP:
+            return DummySFTP()
+
+        def exec_command(self, command: str, timeout: Optional[int] = None):
+            commands.append((command, timeout))
+            return None, DummyStream(b"ok", 0), DummyStream(b"", 0)
+
+        def close(self) -> None:
+            self.closed = True
+
+    class DummyAutoAddPolicy:
+        pass
+
+    dummy_module = types.SimpleNamespace(SSHClient=DummySSHClient, AutoAddPolicy=DummyAutoAddPolicy)
+    monkeypatch.setitem(sys.modules, "paramiko", dummy_module)
+
+    connection = SSHConnectionInfo(
+        host="example.com",
+        username="oracle",
+        remote_directory="/tmp/gui",
+    )
+    executor = SSHExecutor(connection)
+    result = executor.execute(bundle)
+
+    assert result.status == "completed"
+    assert result.stdout == "ok"
+    assert uploaded["/tmp/gui/example.py"] == script_path.read_bytes()
+    assert uploaded["/tmp/gui/config.toml"] == config_text.encode("utf-8")
+    assert commands[0][0].startswith("cd /tmp/gui && python3 example.py --mode legacy")
 
 
 def test_discover_scripts_includes_repo_files():
