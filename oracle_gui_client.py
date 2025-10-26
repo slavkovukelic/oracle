@@ -26,6 +26,7 @@ import logging
 import posixpath
 import pathlib
 import shlex
+import sys
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -486,7 +487,12 @@ def _load_python_parser(script_path: pathlib.Path) -> Optional[argparse.Argument
     if spec is None or spec.loader is None:
         return None
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)  # type: ignore[arg-type]
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)  # type: ignore[arg-type]
+    except Exception:
+        sys.modules.pop(spec.name, None)
+        raise
     if hasattr(module, "build_arg_parser"):
         try:
             parser = module.build_arg_parser()
