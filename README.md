@@ -2,56 +2,56 @@
 
 ## Pregled
 
-`oracle_setup.py` је модернизовани CLI алат намењен припреми Oracle Linux 8 система за Oracle Database и Fusion Middleware радна оптерећења. Омогућава прилагођавање кернел параметара, системских корисника и директоријума према Oracle препорукама. Поред адаптивног Python начина рада који израчунава подешавања на основу тренутног хардвера, доступан је и „legacy” режим који покреће оригинални `oracle.sh` скрипт за 100% усклађене резултате.
+`oracle_setup.py` je modernizovani CLI alat namenjen pripremi Oracle Linux 8 sistema za Oracle Database i Fusion Middleware radna opterećenja. Omogućava prilagođavanje kernel parametara, sistemskih korisnika i direktorijuma prema Oracle preporukama. Pored adaptivnog Python načina rada koji izračunava podešavanja na osnovu trenutnog hardvera, dostupan je i „legacy” režim koji pokreće originalni `oracle.sh` skript za 100% usklađene rezultate.
 
-## Инсталација
+## Instalacija
 
-1. Инсталирајте Python 3.10 или новији (алат подржава и Python 3.11+).
-2. (Опционо) Креирајте виртуелно окружење:
+1. Instalirajte Python 3.10 ili noviji (alat podržava i Python 3.11+).
+2. (Opciono) Kreirajte virtuelno okruženje:
    ```bash
    python3 -m venv .venv
    source .venv/bin/activate
    ```
-3. Инсталирајте зависности из `requirements.txt`:
+3. Instalirajte zavisnosti iz `requirements.txt`:
    ```bash
    pip install -r requirements.txt
    ```
 
-> Напомена: На Python верзијама старијим од 3.11 потребан је пакет `tomli` како би се учитавао TOML конфигурациони фајл.
+> Napomena: Na Python verzijama starijim od 3.11 potreban je paket `tomli` kako bi se učitavao TOML konfiguracioni fajl.
 
-## Покретање
+## Pokretanje
 
-Основни пример покретања (dry-run режим који не уписује измене):
+Osnovni primer pokretanja (dry-run režim koji ne upisuje izmene):
 
 ```bash
 python oracle_setup.py
 ```
 
-Уколико желите да измене буду примењене на систем, користите `--apply` и покрените скрипт као `root`.
+Ukoliko želite da izmene budu primenjene na sistem, koristite `--apply` i pokrenite skript kao `root`.
 
-## CLI опције
+## CLI opcije
 
-Све доступне CLI опције можете комбиновати по потреби:
+Sve dostupne CLI opcije možete kombinovati po potrebi:
 
-- `--oracle-user <име>` – подразумевано `oracle`; корисник за кога се припремају лимити и директоријуми.
-- `--apply` – када је присутно, уписује израчунату конфигурацију на систем (захтева root).
-- `--fmw-user <име>` – подразумевано `fmw`; додатни Fusion Middleware корисник.
-- `--no-fmw` – онемогућава креирање/ажурирање Fusion Middleware корисника и директоријума.
-- `--mode {adaptive,legacy}` – бира да ли се користи Python адаптивни план или историјски `oracle.sh` скрипт.
-- `--inspect` – упоређује тренутно стање система са планираном конфигурацијом и приказује неслагања.
-- `--verbose` / `-v` – повећава количину логовања (понављањем опције прелази се на debug ниво).
-- `--log-file <путања>` – уписује логове у наведени фајл поред излаза на конзолу.
-- `--log-format {text,json}` – формат логова (подразумевано `text`).
-- `--output <путања>` – уписује израчунати план у JSON фајл (корисно у dry-run режиму).
-- `--legacy-script <путања>` – ручно задаје локацију `oracle.sh` скрипта за `legacy` режим.
-- `--config <путања>` – чита конфигурацију из TOML документа (подразумевано `oracle_setup.toml`).
-- `--update-existing-users` – усклађује постојеће системске кориснике са поставкама из конфигурације.
-- `--repo-mode {system,local}` – одређује да ли алат користи постојеће интернет репозиторијуме (`system`) или их привремено замењује локалним ISO/CD-ROM огледалом (`local`).
-- `--local-repo-root <путања>` – путања до монтираног Oracle Linux медија када је активан `--repo-mode=local` (подразумевано `/INSTALL`).
+- `--oracle-user <ime>` – podrazumevano `oracle`; korisnik za koga se pripremaju limiti i direktorijumi.
+- `--apply` – kada je prisutno, upisuje izračunatu konfiguraciju na sistem (zahteva root).
+- `--fmw-user <ime>` – podrazumevano `fmw`; dodatni Fusion Middleware korisnik.
+- `--no-fmw` – onemogućava kreiranje/ažuriranje Fusion Middleware korisnika i direktorijuma.
+- `--mode {adaptive,legacy}` – bira da li se koristi Python adaptivni plan ili istorijski `oracle.sh` skript.
+- `--inspect` – upoređuje trenutno stanje sistema sa planiranom konfiguracijom i prikazuje neslaganja.
+- `--verbose` / `-v` – povećava količinu logovanja (ponavljanjem opcije prelazi se na debug nivo).
+- `--log-file <putanja>` – upisuje logove u navedeni fajl pored izlaza na konzolu.
+- `--log-format {text,json}` – format logova (podrazumevano `text`).
+- `--output <putanja>` – upisuje izračunati plan u JSON fajl (korisno u dry-run režimu).
+- `--legacy-script <putanja>` – ručno zadaje lokaciju `oracle.sh` skripta za `legacy` režim.
+- `--config <putanja>` – čita konfiguraciju iz TOML dokumenta (podrazumevano `oracle_setup.toml`).
+- `--update-existing-users` – usklađuje postojeće sistemske korisnike sa postavkama iz konfiguracije.
+- `--repo-mode {system,local}` – određuje da li alat koristi postojeće internet repozitorijume (`system`) ili ih privremeno zamenjuje lokalnim ISO/CD-ROM ogledalom (`local`).
+- `--local-repo-root <putanja>` – putanja do montiranog Oracle Linux medija kada je aktivan `--repo-mode=local` (podrazumevano `/INSTALL`).
 
-## Пример TOML конфигурације
+## Primer TOML konfiguracije
 
-Следећи пример показује све секције које алат подржава. Свака од њих је опционална осим `[paths]` који мора постојати:
+Sledeći primer pokazuje sve sekcije koje alat podržava. Svaka od njih je opciona osim `[paths]` koji mora postojati:
 
 ```toml
 [packages]
@@ -93,18 +93,18 @@ oratab = "/etc/oratab"
 target_version = "19c"
 ```
 
-### Објашњење секција
+### Objašnjenje sekcija
 
-- `[packages]` – наводи додатне RPM пакете који треба да буду инсталирани; поље `install` је листа назива пакета.
-- `[[groups]]` – сваки унос дефинише системску групу (име и опциони `gid`).
-- `[[users]]` – описује кориснике (име, примарну групу, додатне групе, кућни директоријум, опциони `uid`, љуску и да ли се директорјум креира ако не постоји).
-- `[paths]` – дефинише кључне путање за Oracle софтвер (`data_root`, `profile_dir`, `ora_inventory`, `oratab`).
-- `[database]` – омогућава навођење циљне верзије базе (`target_version`) ради документације и инспекције.
+- `[packages]` – navodi dodatne RPM pakete koji treba da budu instalirani; polje `install` je lista naziva paketa.
+- `[[groups]]` – svaki unos definiše sistemsku grupu (ime i opciono `gid`).
+- `[[users]]` – opisuje korisnike (ime, primarnu grupu, dodatne grupe, kućni direktorijum, opciono `uid`, ljusku i da li se direktorijum kreira ako ne postoji).
+- `[paths]` – definiše ključne putanje za Oracle softver (`data_root`, `profile_dir`, `ora_inventory`, `oratab`).
+- `[database]` – omogućava navođenje ciljne verzije baze (`target_version`) radi dokumentacije i inspekcije.
 
-## Legacy режим
+## Legacy režim
 
-Када је `--mode legacy` постављен, алат покреће оригинални `oracle.sh` скрипт. Ово је корисно за команде које захтевају потпуно исте кораке као у постојећим окружењима. Скрипт се покреће нон-интерактивно и захтева root привилегије ако се примењују измене.
+Kada je `--mode legacy` postavljen, alat pokreće originalni `oracle.sh` skript. Ovo je korisno za komande koje zahtevaju potpuno iste korake kao u postojećim okruženjima. Skript se pokreće non-interaktivno i zahteva root privilegije ako se primenjuju izmene.
 
 ---
 
-За додатне информације прегледајте изворни код `oracle_setup.py` и подразумевану конфигурацију `oracle_setup.toml`.
+Za dodatne informacije pregledajte izvorni kod `oracle_setup.py` i podrazumevanu konfiguraciju `oracle_setup.toml`.
