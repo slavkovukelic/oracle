@@ -39,6 +39,9 @@ def test_limits_include_memlock_for_hugepages():
 def test_plan_serialization(tmp_path):
     res = fake_resources(16)
     plan = oracle_setup.build_plan(res, oracle_setup.DEFAULT_ORACLE_USER, fmw_user=None)
+    kernel = oracle_setup.OracleKernelParameters.from_resources(res)
+    limits = oracle_setup.OracleLimits.from_resources(res)
+    plan = oracle_setup.ConfigurationPlan(res, kernel, limits, oracle_setup.DEFAULT_ORACLE_USER)
 
     data = plan.to_dict()
     assert data["resources"]["mem_total_kb"] == res.mem_total_kb
