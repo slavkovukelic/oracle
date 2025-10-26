@@ -565,16 +565,13 @@ def inspect_current_system(
     plan: "ConfigurationPlan",
     sysctl_reader: Optional[Callable[[str], Optional[str]]] = None,
     package_checker: Optional[Callable[[Iterable[str]], Dict[str, Optional[bool]]]] = None,
-def inspect_current_system(
-    plan: "ConfigurationPlan", sysctl_reader: Optional[Callable[[str], Optional[str]]] = None
 ) -> Dict[str, object]:
     """Compare the live system state with the recommended configuration plan.
 
     ``sysctl_reader`` exists primarily for unit testing and allows callers to
-    override how kernel parameters are retrieved.  ``package_checker`` fulfils a
+    override how kernel parameters are retrieved. ``package_checker`` fulfils a
     similar role for unit tests by allowing them to inject a deterministic view
     of installed packages.
-    override how kernel parameters are retrieved.
     """
 
     reader = sysctl_reader or read_sysctl_value
@@ -635,9 +632,6 @@ def inspect_current_system(
             "unknown": unknown_packages,
             "details": package_details,
         },
-    return {
-        "sysctl": kernel_report,
-        "recommendations": recommendations,
     }
 
 
