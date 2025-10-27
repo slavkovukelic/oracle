@@ -264,7 +264,10 @@ class OracleKernelParameters(object):
 
     @classmethod
     def from_resources(cls, res):
-        page_size = os.sysconf("SC_PAGE_SIZE")
+        page_size_key = "SC_PAGE_SIZE"
+        if PY2:
+            page_size_key = page_size_key.encode("ascii")
+        page_size = os.sysconf(page_size_key)
         shmmax = int(res.mem_total_bytes * 0.9)
         shmall = int(shmmax // page_size)
         shmmni = max(4096, res.cpu_count * 1024)
