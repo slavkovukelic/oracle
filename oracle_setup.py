@@ -60,7 +60,7 @@ import shutil
 import subprocess
 import sys
 from abc import ABC, abstractmethod
-from typing import Callable, Dict, Iterable, List, Mapping, NoReturn, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, NoReturn, Optional, Set, Tuple
 
 try:  # Python 3.11+
     import tomllib
@@ -605,13 +605,14 @@ def load_setup_config(path: Optional[pathlib.Path] = None) -> SetupConfig:
 
 def detect_oracle_linux_major_version(
     os_release_path: pathlib.Path = pathlib.Path("/etc/os-release"),
+    redhat_release_path: pathlib.Path = pathlib.Path("/etc/redhat-release"),
 ) -> Optional[int]:
     """Return the Oracle Linux major release version when available."""
 
     try:
         contents = os_release_path.read_text(encoding="utf-8")
     except FileNotFoundError:
-        return None
+        return _parse_redhat_release(redhat_release_path)
 
     data: Dict[str, str] = {}
     for line in contents.splitlines():
@@ -626,10 +627,25 @@ def detect_oracle_linux_major_version(
     id_like = data.get("ID_LIKE", "").lower().split()
 
     if "oracle" not in name_value and id_value not in {"ol", "oracle"} and "ol" not in id_like:
+        fallback = _parse_redhat_release(redhat_release_path)
+        if fallback is not None:
+            return fallback
         return None
 
     version_id = data.get("VERSION_ID", "")
     match = re.match(r"^(\d+)", version_id)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def _parse_redhat_release(redhat_release_path: pathlib.Path) -> Optional[int]:
+    try:
+        contents = redhat_release_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+
+    match = re.search(r"release\s+(\d+)", contents, re.IGNORECASE)
     if not match:
         return None
     return int(match.group(1))
@@ -1166,12 +1182,42 @@ def _oratab_file(path: pathlib.Path) -> FileSpec:
     return FileSpec(path=path, content=content, owner="root", group="root", mode=0o664)
 
 
+def _modern_package_names(packages: List[str]) -> List[str]:
+    mapped: List[str] = []
+    seen: Set[str] = set()
+    extras: List[str] = []
+
+    for pkg in packages:
+        replacement = pkg
+        if pkg == "python":
+            replacement = "python3"
+        elif pkg.startswith("python-"):
+            replacement = "python3-" + pkg[len("python-") :]
+        elif pkg.startswith("libnsl") and pkg not in {"libnsl2", "libnsl2.i686"}:
+            if pkg.endswith(".i686"):
+                extras.append("libnsl2.i686")
+            else:
+                extras.append("libnsl2")
+        if replacement not in seen:
+            seen.add(replacement)
+            mapped.append(replacement)
+
+    for name in extras:
+        if name not in seen:
+            seen.add(name)
+            mapped.append(name)
+
+    return mapped
+
+
 def _packages_for_plan(config: SetupConfig) -> List[str]:
     packages = list(config.packages)
     if not packages:
         return packages
 
     os_major = detect_oracle_linux_major_version()
+    if os_major is not None and os_major >= 8:
+        packages = _modern_package_names(packages)
     if os_major is None or os_major < 8 or "compat-libcap1" not in packages:
         return packages
 
