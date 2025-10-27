@@ -23,6 +23,7 @@ import base64
 import dataclasses
 import importlib.util
 import logging
+import re
 import posixpath
 import pathlib
 import shlex
@@ -30,6 +31,7 @@ import sys
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+import tkinter.font as tkfont
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 LOG = logging.getLogger(__name__)
@@ -540,6 +542,10 @@ class OracleSetupClient(tk.Tk):
         self.repo_mount_var = tk.StringVar(value="")
         self.repo_mount_enabled_var = tk.BooleanVar(value=False)
 
+        self.log_window: Optional[tk.Toplevel] = None
+        self.log_widget: Optional[tk.Text] = None
+        self._log_font: Optional[tkfont.Font] = None
+
         self._build_ui()
         self._load_config()
         if self.script_var.get():
@@ -639,6 +645,73 @@ class OracleSetupClient(tk.Tk):
         log_frame.pack(fill="both", expand=True)
         self.log_text = tk.Text(log_frame, wrap="word", height=12, state="disabled", background="#111", foreground="#eee")
         self.log_text.pack(fill="both", expand=True, padx=8, pady=8)
+
+    def _ensure_log_window(self) -> None:
+        if self.log_window is not None and self.log_window.winfo_exists():
+            return
+
+        self.log_window = tk.Toplevel(self)
+        self.log_window.title("Remote Execution Log")
+        self.log_window.minsize(700, 500)
+
+        container = ttk.Frame(self.log_window)
+        container.pack(fill="both", expand=True, padx=12, pady=12)
+
+        scrollbar = ttk.Scrollbar(container, orient="vertical")
+        scrollbar.pack(side="right", fill="y")
+
+        base_font = tkfont.nametofont("TkFixedFont").copy()
+        base_font.configure(size=12)
+        self._log_font = base_font
+
+        self.log_widget = tk.Text(
+            container,
+            wrap="word",
+            yscrollcommand=scrollbar.set,
+            background="#0e1117",
+            foreground="#e6edf3",
+            insertbackground="#e6edf3",
+            font=self._log_font,
+        )
+        self.log_widget.pack(side="left", fill="both", expand=True)
+        scrollbar.configure(command=self.log_widget.yview)
+
+        self.log_widget.tag_configure("default", foreground="#e6edf3")
+        self.log_widget.tag_configure("match", foreground="#2ecc71")
+        self.log_widget.tag_configure("mismatch", foreground="#e74c3c")
+
+        def _on_close() -> None:
+            if self.log_window is None:
+                return
+            window = self.log_window
+            self.log_window = None
+            self.log_widget = None
+            window.destroy()
+
+        self.log_window.protocol("WM_DELETE_WINDOW", _on_close)
+
+    def _open_log_window(self) -> None:
+        self._ensure_log_window()
+        if self.log_window is not None:
+            self.log_window.deiconify()
+            self.log_window.lift()
+
+    def _classify_log_line(self, line: str) -> str:
+        match = re.search(r"current:\s*(?P<current>[^\s].*?)\s+expected:\s*(?P<expected>.+)$", line)
+        if not match:
+            return "default"
+        current = match.group("current").strip()
+        expected = match.group("expected").strip()
+        return "match" if current == expected else "mismatch"
+
+    def _write_to_log_window(self, message: str) -> None:
+        if self.log_widget is None:
+            return
+        lines = message.splitlines() or [""]
+        for line in lines:
+            tag = self._classify_log_line(line)
+            self.log_widget.insert("end", line + "\n", tag)
+        self.log_widget.see("end")
 
     # ----------------------------------------------------------- ARGUMENTS ---
     def _on_script_selected(self) -> None:
@@ -806,6 +879,9 @@ class OracleSetupClient(tk.Tk):
             return
         executor = SSHExecutor(connection)
 
+        self._open_log_window()
+        if self.log_widget is not None:
+            self.log_widget.delete("1.0", "end")
         self.run_button.configure(state="disabled")
         self._append_log("Dispatching execution request...")
 
@@ -839,6 +915,8 @@ class OracleSetupClient(tk.Tk):
 
     def _append_log(self, message: str) -> None:
         def append() -> None:
+            self._open_log_window()
+            self._write_to_log_window(message)
             self.log_text.configure(state="normal")
             self.log_text.insert("end", message + "\n")
             self.log_text.see("end")
