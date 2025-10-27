@@ -679,6 +679,7 @@ class OracleSetupClient(tk.Tk):
         self.log_widget.tag_configure("default", foreground="#e6edf3")
         self.log_widget.tag_configure("match", foreground="#2ecc71")
         self.log_widget.tag_configure("mismatch", foreground="#e74c3c")
+        self.log_widget.tag_configure("warning", foreground="#f1c40f")
 
         def _on_close() -> None:
             if self.log_window is None:
@@ -697,6 +698,16 @@ class OracleSetupClient(tk.Tk):
             self.log_window.lift()
 
     def _classify_log_line(self, line: str) -> str:
+        status_match = re.search(r"[\"']status[\"']\s*:\s*[\"'](?P<status>[^\"']+)[\"']", line)
+        if status_match:
+            status = status_match.group("status").strip().lower()
+            if status in {"ok", "completed", "success", "installed"}:
+                return "match"
+            if status in {"needs_update", "failed", "missing", "error"}:
+                return "mismatch"
+            if status in {"unknown", "warning"}:
+                return "warning"
+
         match = re.search(r"current:\s*(?P<current>[^\s].*?)\s+expected:\s*(?P<expected>.+)$", line)
         if not match:
             return "default"
