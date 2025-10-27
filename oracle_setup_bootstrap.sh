@@ -1,7 +1,18 @@
 #!/usr/bin/env bash
+test -z "${ORACLE_BOOTSTRAP_SANITIZED_SCRIPT:-}" && LC_ALL=C grep -q $'\r' "$0" && ORACLE_BOOTSTRAP_SOURCE_DIR="$(cd -- "$(dirname -- "$0")" && pwd)" && sanitized_copy=$(mktemp) && [ -n "$sanitized_copy" ] && tr -d '\r' <"$0" >"$sanitized_copy" && ORACLE_BOOTSTRAP_SANITIZED_SCRIPT="$sanitized_copy" && export ORACLE_BOOTSTRAP_SANITIZED_SCRIPT ORACLE_BOOTSTRAP_SOURCE_DIR && exec bash "$sanitized_copy" "$@"
+
 set -u
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -n "${ORACLE_BOOTSTRAP_SANITIZED_SCRIPT:-}" ]]; then
+  trap 'rm -f "$ORACLE_BOOTSTRAP_SANITIZED_SCRIPT"' EXIT
+fi
+
+if [[ -n "${ORACLE_BOOTSTRAP_SOURCE_DIR:-}" ]]; then
+  SCRIPT_DIR="$ORACLE_BOOTSTRAP_SOURCE_DIR"
+  unset ORACLE_BOOTSTRAP_SOURCE_DIR
+else
+  SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+fi
 
 run_setup() {
   local interpreter=$1
