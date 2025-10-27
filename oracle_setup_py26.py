@@ -16,7 +16,7 @@ behavioural parity between the two implementations.
 
 from __future__ import absolute_import, division, print_function, unicode_literals
 
-import argparse
+from optparse import OptionParser
 import datetime as _dt
 import json
 import logging
@@ -1378,15 +1378,28 @@ class Provisioner(object):
 
 
 def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description="Python 2 compatible oracle setup utility")
-    parser.add_argument("--oracle-user", default=DEFAULT_ORACLE_USER)
-    parser.add_argument("--fmw-user", default="fmw")
-    parser.add_argument("--sysctl-path", default="/etc/sysctl.conf")
-    parser.add_argument("--limits-path", default="/etc/security/limits.d/oracle.conf")
-    parser.add_argument("--apply", action="store_true")
-    parser.add_argument("--inspect", action="store_true")
-    parser.add_argument("--mode", choices=["adaptive", "legacy"], default="adaptive")
-    return parser.parse_args(argv)
+    parser = OptionParser(description="Python 2 compatible oracle setup utility")
+    parser.add_option("--oracle-user", dest="oracle_user", default=DEFAULT_ORACLE_USER)
+    parser.add_option("--fmw-user", dest="fmw_user", default="fmw")
+    parser.add_option("--sysctl-path", dest="sysctl_path", default="/etc/sysctl.conf")
+    parser.add_option(
+        "--limits-path",
+        dest="limits_path",
+        default="/etc/security/limits.d/oracle.conf",
+    )
+    parser.add_option("--apply", action="store_true", dest="apply", default=False)
+    parser.add_option("--inspect", action="store_true", dest="inspect", default=False)
+    parser.add_option(
+        "--mode",
+        dest="mode",
+        type="choice",
+        choices=["adaptive", "legacy"],
+        default="adaptive",
+    )
+    options, positional = parser.parse_args(argv)
+    if positional:
+        parser.error("unexpected positional arguments: %s" % (", ".join(positional),))
+    return options
 
 
 def main(argv=None):
