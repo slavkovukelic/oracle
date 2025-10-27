@@ -26,6 +26,8 @@ import shutil
 import subprocess
 import sys
 
+PY2 = sys.version_info[0] == 2
+
 try:
     import grp
 except ImportError:  # pragma: no cover - Windows compatibility
@@ -697,9 +699,12 @@ class SystemInspector(object):
         mem_total_kb = int(meminfo.get("MemTotal", 0))
         swap_total_kb = int(meminfo.get("SwapTotal", 0))
         hugepage_size_kb = int(meminfo.get(self.HUGE_PAGE_SIZE_KEY, 2048))
+        cpu_key = "SC_NPROCESSORS_ONLN"
+        if PY2:
+            cpu_key = cpu_key.encode("ascii")
         try:
-            cpu_count = os.sysconf("SC_NPROCESSORS_ONLN")
-        except (AttributeError, ValueError):
+            cpu_count = os.sysconf(cpu_key)
+        except (AttributeError, TypeError, ValueError):
             cpu_count = 0
         if not cpu_count:
             cpu_count = 1
